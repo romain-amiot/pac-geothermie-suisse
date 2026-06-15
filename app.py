@@ -1,8 +1,47 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 import matplotlib.pyplot as plt
 import pandas as pd
 import streamlit as st
+
+
+# ============================================================
+# COMPATIBILITÉ STREAMLIT CLOUD / LINUX
+# ============================================================
+#
+# Sur Windows, les chemins ne sont pas sensibles à la casse :
+# "Data/..." et "data/..." pointent vers le même dossier.
+# Sur Streamlit Cloud, l'application tourne sous Linux, où la casse compte.
+#
+# Certains modules historiques du projet peuvent chercher les fichiers dans
+# "data/...", alors que le dépôt GitHub contient le dossier "Data/".
+# On crée donc au démarrage un alias "data" -> "Data" avant d'importer les
+# modules internes qui chargent les CSV.
+#
+# Correction plus propre à long terme : harmoniser tous les chemins du projet
+# pour utiliser exactement le même nom de dossier, idéalement "Data" partout.
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_ROOT / "Data"
+LOWER_DATA_DIR = PROJECT_ROOT / "data"
+
+
+def ensure_data_directory_alias() -> None:
+    if not DATA_DIR.exists() or LOWER_DATA_DIR.exists():
+        return
+
+    try:
+        # Fonctionne sur Streamlit Cloud / Linux.
+        os.symlink(DATA_DIR, LOWER_DATA_DIR, target_is_directory=True)
+    except Exception:
+        # Sur Windows, la création de symlink peut demander des droits admin.
+        # Ce n'est pas bloquant localement, car Windows ne distingue pas Data/data.
+        pass
+
+
+ensure_data_directory_alias()
 
 from models import ProjectInputs
 from services.calcul_projet import (

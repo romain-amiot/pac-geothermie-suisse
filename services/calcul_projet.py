@@ -1,10 +1,67 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+# ============================================================
+# CHEMINS ROBUSTES POUR STREAMLIT CLOUD
+# ============================================================
+#
+# En local Windows, les chemins ne distinguent pas strictement Data/ et data/.
+# Sur Streamlit Cloud, l'application tourne sous Linux : la casse compte.
+# On définit donc la racine du projet dès le début du module et, si possible,
+# on crée des alias data -> Data et tools -> Tools. Cela sécurise aussi les
+# fonctions importées depuis Fonctions/ qui peuvent encore utiliser des chemins
+# historiques en minuscules.
+
+BASE_DIR = Path(__file__).resolve().parents[1]
+
+
+def _ensure_streamlit_cloud_case_aliases() -> None:
+    """Crée des alias de casse pour éviter les erreurs Data/data sous Linux.
+
+    Cette opération est sans effet sur Windows et reste non bloquante : si le
+    système ne permet pas les liens symboliques, le code continue simplement
+    avec les chemins explicites BASE_DIR / "Data" utilisés ci-dessous.
+    """
+    aliases = [
+        (BASE_DIR / "Data", BASE_DIR / "data"),
+        (BASE_DIR / "Tools", BASE_DIR / "tools"),
+    ]
+
+    for source, alias in aliases:
+        try:
+            if source.exists() and not alias.exists():
+                os.symlink(source, alias, target_is_directory=True)
+        except Exception:
+            # Non critique : les constantes de ce fichier utilisent déjà la casse correcte.
+            pass
+
+
+def project_path(*parts: str) -> Path:
+    """Retourne un chemin absolu depuis la racine du projet."""
+    return BASE_DIR.joinpath(*parts)
+
+
+def first_existing_path(*paths: Path) -> Path:
+    """Retourne le premier chemin existant, sinon le premier chemin fourni.
+
+    Utile pour garder des fallbacks entre fichiers conservés dans le dépôt et
+    fichiers locaux de calibration exclus de GitHub.
+    """
+    for path in paths:
+        if path.exists():
+            return path
+    if not paths:
+        raise ValueError("Aucun chemin fourni.")
+    return paths[0]
+
+
+_ensure_streamlit_cloud_case_aliases()
 
 from models import ProjectInputs
 from Fonctions.puissance_pointe import calcul_pointe_et_energie_annuelle
@@ -25,14 +82,23 @@ from Fonctions.climat import (
 from Fonctions.localisation import postcode_info
 
 
-BASE_DIR = Path(__file__).resolve().parents[1]
+SCEN_ELEC_CSV = str(project_path("Data", "processed", "scenarios_electricity_ttc_by_canton.csv"))
+SCEN_GAS_CSV = str(project_path("Data", "processed", "scenarios_gas.csv"))
+SCEN_OIL_CSV = str(project_path("Data", "processed", "scenarios_mazout.csv"))
 
-SCEN_ELEC_CSV = str(BASE_DIR / "Data" / "processed" / "scenarios_electricity_ttc_by_canton.csv")
-SCEN_GAS_CSV = str(BASE_DIR / "Data" / "processed" / "scenarios_gas.csv")
-SCEN_OIL_CSV = str(BASE_DIR / "Data" / "processed" / "scenarios_mazout.csv")
-
-COOLING_QREF_CALIBRATED_CSV = BASE_DIR / "Tools" / "ajuster_coef_froid" / "cooling_qref_calibrated_weighted.csv"
-CLIMATE_STATION_REFERENCE_CSV = BASE_DIR / "Tools" / "ajuster_coef_froid" / "climate_station_reference.csv"
+# Les deux fichiers suivants sont utilisés s'ils sont disponibles.
+# Sur la version déployée, ils peuvent être absents si les dossiers de calibration
+# ont été exclus du dépôt : le code retombe alors sur les valeurs fallback internes.
+COOLING_QREF_CALIBRATED_CSV = first_existing_path(
+    project_path("Tools", "ajuster_coef_froid", "cooling_qref_calibrated_weighted.csv"),
+    project_path("Data", "cooling_qref_calibrated_weighted.csv"),
+)
+CLIMATE_STATION_REFERENCE_CSV = first_existing_path(
+    project_path("Tools", "ajuster_coef_froid", "climate_station_reference.csv"),
+    project_path("Data", "climate_station_reference.csv"),
+    project_path("Data", "climate_station_reference_detail.csv"),
+    project_path("Data", "climate_station_reference.csv"),
+)
 
 CO2_FACTORS_G_PER_KWH: dict[str, float] = {
     "Électricité (réseau)": 90,
@@ -851,9 +917,10 @@ def load_cooling_qref_table() -> pd.DataFrame | None:
         return _QREF_CACHE
     candidate_paths = [
         COOLING_QREF_CALIBRATED_CSV,
+        project_path("Data", "cooling_qref_calibrated_weighted.csv"),
+        project_path("Tools", "ajuster_coef_froid", "cooling_qref_calibrated_weighted.csv"),
         BASE_DIR / "cooling_qref_calibrated_weighted.csv",
         Path.cwd() / "cooling_qref_calibrated_weighted.csv",
-        Path.cwd() / "Tools" / "ajuster_coef_froid" / "cooling_qref_calibrated_weighted.csv",
     ]
     for path in candidate_paths:
         if path.exists():
@@ -875,9 +942,11 @@ def load_climate_station_reference() -> pd.DataFrame | None:
         return _CLIMATE_REF_CACHE
     candidate_paths = [
         CLIMATE_STATION_REFERENCE_CSV,
+        project_path("Data", "climate_station_reference.csv"),
+        project_path("Data", "climate_station_reference_detail.csv"),
+        project_path("Tools", "ajuster_coef_froid", "climate_station_reference.csv"),
         BASE_DIR / "climate_station_reference.csv",
         Path.cwd() / "climate_station_reference.csv",
-        Path.cwd() / "Tools" / "ajuster_coef_froid" / "climate_station_reference.csv",
     ]
     for path in candidate_paths:
         if path.exists():
