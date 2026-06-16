@@ -118,31 +118,22 @@ RENDEMENTS_STANDARDS: dict[str, float] = {
 
 # Libellés grand public pour conserver les coefficients Ubat internes
 # sans les afficher directement à l'utilisateur.
-DATE_CONSTRUCTION_LABELS = {
-    "Peu isolé": "Construction antérieure à 1974",
-    "Années 1970": "Construction entre 1975 et 1980",
-    "Années 1980": "Construction entre 1981 et 1990",
-    "Années 1990": "Construction entre 1991 et 2000",
-    "Années 2000": "Construction entre 2001 et 2012",
-    "Exceptionnel": "Construction postérieure à 2012 avec isolation exceptionnelle",
-    "Très performant": "Construction postérieure à 2012 sans ponts thermiques",
+#
+# On n'utilise pas directement les clés de UBAT_CHOICES dans l'interface,
+# car elles peuvent être des chiffres ou des libellés techniques.
+# L'utilisateur voit uniquement ces catégories simplifiées, et le modèle
+# reçoit seulement le coefficient Ubat correspondant.
+DATE_CONSTRUCTION_UBAT = {
+    "Construction après 2012 avec isolation exceptionnelle": 0.30,
+    "Construction après 2012 sans ponts thermiques": 0.40,
+    "Construction 2001-2012": 0.75,
+    "Construction 1990-2000": 0.95,
+    "Construction 1983-1989": 1.15,
+    "Construction 1974-1982": 1.40,
+    "Construction avant 1974": 1.80,
 }
 
-
-def format_date_construction_label(key: str) -> str:
-    """Affiche un libellé grand public pour les catégories Ubat.
-
-    UBAT_CHOICES peut utiliser comme clés des nombres 1..7. On récupère donc
-    d'abord le libellé interne stocké dans la valeur, par exemple
-    "Exceptionnel", "Très performant", "Années 2000", etc., puis on le
-    remplace par le libellé destiné au grand public.
-    """
-    try:
-        internal_label = str(UBAT_CHOICES[key][0])
-    except Exception:
-        internal_label = str(key)
-
-    return DATE_CONSTRUCTION_LABELS.get(internal_label, internal_label)
+DATE_CONSTRUCTION_CHOICES = list(DATE_CONSTRUCTION_UBAT.keys())
 
 TYPOLOGIES_MENU = [
     ("maison_individuelle", "Maison individuelle"),
@@ -1046,17 +1037,16 @@ def build_inputs_from_form() -> ProjectInputs:
     )
     building_type_key = next(key for key, label in TYPOLOGIES_MENU if label == building_type_label)
 
-    ubat_label = st.selectbox(
+    date_construction_label = st.selectbox(
         "Date de construction",
-        options=list(UBAT_CHOICES.keys()),
-        format_func=format_date_construction_label,
+        options=DATE_CONSTRUCTION_CHOICES,
         index=2,
     )
     st.caption(
         "Si l'isolation du bâtiment a été rénovée, prenez la date de ces travaux "
         "plutôt que la date de construction initiale."
     )
-    ubat = UBAT_CHOICES[ubat_label][1]
+    ubat = float(DATE_CONSTRUCTION_UBAT[date_construction_label])
 
     # Le mémoire retient une valeur standard fixe R = 0.20 W/m³K.
     # On supprime donc le choix utilisateur de la ventilation et son affichage.
