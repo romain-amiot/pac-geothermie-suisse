@@ -105,9 +105,9 @@ CANTONS_SWISS = [
 ]
 
 ENERGY_CHOICES = {
-    "Électricité (réseau)": "Électricité (réseau)",
     "Gaz naturel": "Gaz naturel",
     "Mazout (fioul)": "Mazout (fioul)",
+    "Électricité (réseau)": "Électricité (réseau)",
 }
 
 RENDEMENTS_STANDARDS: dict[str, float] = {
@@ -1292,6 +1292,10 @@ def build_inputs_from_form() -> ProjectInputs:
 
     if project_type == "replacement":
         st.header("3. Système actuel")
+        st.write(
+            "Cette section concerne les paramètres de votre système de chauffage "
+            "actuellement utilisé installé."
+        )
 
         c1, c2 = st.columns(2)
 
@@ -1309,6 +1313,10 @@ def build_inputs_from_form() -> ProjectInputs:
                 value=float(RENDEMENTS_STANDARDS[current_energy]),
                 step=0.01,
             )
+            st.caption(
+                "Si vous ne connaissez pas le rendement de votre système de chauffage, "
+                "veuillez laisser la valeur associée par défaut."
+            )
 
         has_existing_ac = st.checkbox(
             "Le bâtiment a déjà une climatisation",
@@ -1317,7 +1325,7 @@ def build_inputs_from_form() -> ProjectInputs:
 
         if has_existing_ac:
             eer_current_ac = st.number_input(
-                "Performance clim existante (EER)",
+                "Rendement de la clim actuelle",
                 min_value=0.5,
                 value=EER_CLIM_ACTUEL_DEFAULT,
                 step=0.1,
