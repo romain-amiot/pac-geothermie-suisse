@@ -116,6 +116,22 @@ RENDEMENTS_STANDARDS: dict[str, float] = {
     "Mazout (fioul)": 0.90,
 }
 
+# Libellés grand public pour conserver les coefficients Ubat internes
+# sans les afficher directement à l'utilisateur.
+DATE_CONSTRUCTION_LABELS = {
+    "Peu isolé": "Construction antérieure à 1974",
+    "Années 1970": "Construction entre 1975 et 1980",
+    "Années 1980": "Construction entre 1981 et 1990",
+    "Années 1990": "Construction entre 1991 et 2000",
+    "Années 2000": "Construction entre 2001 et 2012",
+    "Exceptionnel": "Construction postérieure à 2012 avec isolation exceptionnelle",
+    "Très performant": "Construction postérieure à 2012 sans ponts thermiques",
+}
+
+
+def format_date_construction_label(key: str) -> str:
+    return DATE_CONSTRUCTION_LABELS.get(str(key), str(key))
+
 TYPOLOGIES_MENU = [
     ("maison_individuelle", "Maison individuelle"),
     ("residentiel_collectif", "Immeuble résidentiel collectif"),
@@ -968,15 +984,20 @@ def build_inputs_from_form() -> ProjectInputs:
     )
     project_type = "replacement" if project_type_label == "Remplacement ancien chauffage" else "new_building"
 
-    # ========================================================
-    # LOCALISATION PAR CODE POSTAL
-    # ========================================================
-
-    postcode = st.sidebar.text_input("Code postal", value="1000")
-
     postcode_valid = False
     postcode_meta = None
     canton = "Vaud"  # fallback interne, mais le calcul sera bloqué si postcode_valid = False
+
+    # ========================================================
+    # BÂTIMENT
+    # ========================================================
+
+    st.header("1. Caractéristiques du bâtiment")
+
+    # Le code postal est placé dans le corps principal de l'application,
+    # car c'est une information centrale pour l'utilisateur : il détermine
+    # automatiquement le canton et la station climatique utilisée.
+    postcode = st.text_input("Code postal du bâtiment", value="1000")
 
     if postcode.strip():
         try:
@@ -984,34 +1005,28 @@ def build_inputs_from_form() -> ProjectInputs:
             canton = postcode_meta["canton_name"]
             postcode_valid = True
 
-            st.sidebar.success(
-                f"{postcode_meta['locality']} — "
+            st.success(
+                f"Localisation reconnue : {postcode_meta['locality']} — "
                 f"{postcode_meta['canton_abbr']} "
                 f"({postcode_meta['canton_name']})"
             )
 
         except ValueError as e:
-            st.sidebar.error(str(e))
+            st.error(str(e))
             postcode_valid = False
 
         except Exception as e:
-            st.sidebar.error(
+            st.error(
                 "Erreur lors de la lecture de la base des codes postaux. "
                 f"Détail : {e}"
             )
             postcode_valid = False
     else:
-        st.sidebar.error("Code postal invalide. Veuillez vérifier votre saisie.")
+        st.error("Code postal invalide. Veuillez vérifier votre saisie.")
         postcode_valid = False
 
     st.session_state["postcode_valid"] = postcode_valid
     st.session_state["postcode_meta"] = postcode_meta
-
-    # ========================================================
-    # BÂTIMENT
-    # ========================================================
-
-    st.header("1. Caractéristiques du bâtiment")
 
     building_type_label = st.selectbox(
         "Typologie du bâtiment",
@@ -1020,20 +1035,20 @@ def build_inputs_from_form() -> ProjectInputs:
     building_type_key = next(key for key, label in TYPOLOGIES_MENU if label == building_type_label)
 
     ubat_label = st.selectbox(
-        "Niveau d'isolation (Ubat)",
+        "Date de construction",
         options=list(UBAT_CHOICES.keys()),
-        format_func=lambda key: f"{UBAT_CHOICES[key][0]} — {UBAT_CHOICES[key][1]}",
+        format_func=format_date_construction_label,
         index=2,
+    )
+    st.caption(
+        "Si l'isolation du bâtiment a été rénovée, prenez la date de ces travaux "
+        "plutôt que la date de construction initiale."
     )
     ubat = UBAT_CHOICES[ubat_label][1]
 
     # Le mémoire retient une valeur standard fixe R = 0.20 W/m³K.
-    # On supprime donc le choix utilisateur de la ventilation.
+    # On supprime donc le choix utilisateur de la ventilation et son affichage.
     ventilation_r = DEFAULT_VENTILATION_R
-    st.caption(
-        f"Coefficient de ventilation retenu : R = {ventilation_r:.2f} W/m³K "
-        "(valeur par défaut du modèle)."
-    )
 
     # ========================================================
     # GÉOMÉTRIE
@@ -1659,7 +1674,13 @@ def init_session_state() -> None:
 
 def main() -> None:
     st.title("Rentabilité d'une PAC géothermique en Suisse")
-    st.caption("Version structurée — cas central, incertitudes, sensibilités et graphique interactif")
+    st.write(
+        "Cet outil permet de déterminer la rentabilité de l'installation d'une pompe "
+        "à chaleur géothermique par rapport à votre système de chauffage actuel. "
+        "Il prend en compte au mieux les caractéristiques de votre bâtiment et propose "
+        "une aide à la décision, mais il ne remplace pas un devis détaillé réalisé par "
+        "des professionnels."
+    )
 
     init_session_state()
 
