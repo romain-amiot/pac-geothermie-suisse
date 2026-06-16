@@ -130,7 +130,19 @@ DATE_CONSTRUCTION_LABELS = {
 
 
 def format_date_construction_label(key: str) -> str:
-    return DATE_CONSTRUCTION_LABELS.get(str(key), str(key))
+    """Affiche un libellé grand public pour les catégories Ubat.
+
+    UBAT_CHOICES peut utiliser comme clés des nombres 1..7. On récupère donc
+    d'abord le libellé interne stocké dans la valeur, par exemple
+    "Exceptionnel", "Très performant", "Années 2000", etc., puis on le
+    remplace par le libellé destiné au grand public.
+    """
+    try:
+        internal_label = str(UBAT_CHOICES[key][0])
+    except Exception:
+        internal_label = str(key)
+
+    return DATE_CONSTRUCTION_LABELS.get(internal_label, internal_label)
 
 TYPOLOGIES_MENU = [
     ("maison_individuelle", "Maison individuelle"),
