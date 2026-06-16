@@ -1057,10 +1057,17 @@ def build_inputs_from_form() -> ProjectInputs:
     # ========================================================
 
     st.header("2. Géométrie et données thermiques")
+    st.write(
+        "Cette section permet de déterminer la surface de déperdition du bâtiment "
+        "ainsi que le volume habitable. La surface de déperdition représente "
+        "l'ensemble des parois en contact avec l'extérieur. Plusieurs méthodes "
+        "de saisie sont disponibles, en fonction de vos connaissances des "
+        "paramètres du bâtiment."
+    )
 
     sdep_mode = st.radio(
-        "Méthode de saisie de Sdép / Vh",
-        options=["Saisie directe", "Estimation par typologie", "Estimation par périmètre"],
+        "Méthode de saisie de la géométrie du bâtiment",
+        options=["Estimation par typologie", "Estimation par périmètre", "Saisie directe"],
         horizontal=True,
     )
 
@@ -1077,39 +1084,19 @@ def build_inputs_from_form() -> ProjectInputs:
     longueur_m = None
     largeur_m = None
 
-    if sdep_mode == "Saisie directe":
-        c1, c2 = st.columns(2)
-
-        with c1:
-            sdep_m2 = st.number_input(
-                "Sdép (m²)",
-                min_value=1.0,
-                value=350.0,
-                step=10.0,
-            )
-
-        with c2:
-            vh_m3 = st.number_input(
-                "Vh (m³)",
-                min_value=1.0,
-                value=600.0,
-                step=10.0,
-            )
-
-    elif sdep_mode == "Estimation par typologie":
+    if sdep_mode == "Estimation par typologie":
         defaults = DEFAULT_GEOMETRY_BY_BUILDING_TYPE[building_type_key]
 
         st.caption(
-            "La forme générale n'est pas demandée : elle est déjà intégrée dans "
-            "le coefficient typologique associé au type de bâtiment. Les corrections "
-            "restantes portent sur la mitoyenneté et l'exposition de la toiture/plancher."
+            "Méthode la plus générale, à privilégier si vous ne connaissez pas "
+            "les paramètres techniques du bâtiment."
         )
 
         c1, c2, c3 = st.columns(3)
 
         with c1:
             shab_m2 = st.number_input(
-                "Surface chauffée Shab (m²)",
+                "Surface habitable (m²)",
                 min_value=1.0,
                 value=180.0,
                 step=10.0,
@@ -1126,7 +1113,7 @@ def build_inputs_from_form() -> ProjectInputs:
 
         with c3:
             hauteur_m = st.number_input(
-                "Hauteur moyenne chauffée (m)",
+                "Hauteur sous plafond (m)",
                 min_value=1.8,
                 value=float(defaults["hauteur_m"]),
                 step=0.1,
@@ -1166,41 +1153,39 @@ def build_inputs_from_form() -> ProjectInputs:
             plancher_expose=bool(plancher_expose),
         )
 
-        st.info(
-            f"Estimation typologique : "
-            f"K = {geo_meta['k_typologique']:.2f} | "
-            f"niveaux = {geo_meta['niveaux_utilisateur']} | "
-            f"hauteur = {geo_meta['hauteur_utilisateur_m']:.1f} m "
-            f"(réf. {geo_meta['hauteur_ref_m']:.1f} m, facteur {geo_meta['facteur_hauteur']:.2f}) | "
-            f"empreinte = {geo_meta['empreinte_sol_m2']:.1f} m² | "
-            f"vertical corrigé = {geo_meta['s_vertical_corrigee_m2']:.1f} m² | "
-            f"vertical après mitoyenneté = {geo_meta['s_vertical_apres_mitoyennete_m2']:.1f} m² | "
-            f"toiture = {geo_meta['s_toiture_m2']:.1f} m² | "
-            f"plancher = {geo_meta['s_plancher_m2']:.1f} m² | "
-            f"Sdép corrigée ≈ {sdep_est:.1f} m² | "
-            f"Vh ≈ {vh_est:.1f} m³"
+        st.caption(
+            "Voici les paramètres estimés de votre bâtiment. Vous pouvez les "
+            "modifier si vous disposez de données plus précises."
         )
 
-        sdep_m2 = st.number_input(
-            "Sdép corrigée (m²)",
-            min_value=1.0,
-            value=float(sdep_est),
-            step=10.0,
+        c7, c8 = st.columns(2)
+
+        with c7:
+            sdep_m2 = st.number_input(
+                "Surface de déperdition estimée (m²)",
+                min_value=1.0,
+                value=float(sdep_est),
+                step=10.0,
+            )
+
+        with c8:
+            vh_m3 = st.number_input(
+                "Volume habitable (m³)",
+                min_value=1.0,
+                value=float(vh_est),
+                step=10.0,
+            )
+
+    elif sdep_mode == "Estimation par périmètre":
+        st.caption(
+            "Méthode intermédiaire si vous connaissez le périmètre extérieur du bâtiment."
         )
 
-        vh_m3 = st.number_input(
-            "Vh corrigé (m³)",
-            min_value=1.0,
-            value=float(vh_est),
-            step=10.0,
-        )
-
-    else:
         c1, c2, c3, c4 = st.columns(4)
 
         with c1:
             shab_m2 = st.number_input(
-                "Surface chauffée Shab (m²)",
+                "Surface habitable (m²)",
                 min_value=1.0,
                 value=180.0,
                 step=10.0,
@@ -1250,24 +1235,51 @@ def build_inputs_from_form() -> ProjectInputs:
             plancher_expose,
         )
 
-        st.info(
-            f"Estimation automatique : Sdép ≈ {sdep_est:.1f} m² | "
-            f"Vh ≈ {vh_est:.1f} m³"
+        st.caption(
+            "Voici les paramètres estimés de votre bâtiment. Vous pouvez les "
+            "modifier si vous disposez de données plus précises."
         )
 
-        sdep_m2 = st.number_input(
-            "Sdép corrigée (m²)",
-            min_value=1.0,
-            value=float(sdep_est),
-            step=10.0,
+        c5, c6 = st.columns(2)
+
+        with c5:
+            sdep_m2 = st.number_input(
+                "Surface de déperdition estimée (m²)",
+                min_value=1.0,
+                value=float(sdep_est),
+                step=10.0,
+            )
+
+        with c6:
+            vh_m3 = st.number_input(
+                "Volume habitable (m³)",
+                min_value=1.0,
+                value=float(vh_est),
+                step=10.0,
+            )
+
+    else:
+        st.caption(
+            "Méthode la plus précise si vous connaissez les paramètres techniques du bâtiment."
         )
 
-        vh_m3 = st.number_input(
-            "Vh corrigé (m³)",
-            min_value=1.0,
-            value=float(vh_est),
-            step=10.0,
-        )
+        c1, c2 = st.columns(2)
+
+        with c1:
+            sdep_m2 = st.number_input(
+                "Surface de déperdition (m²)",
+                min_value=1.0,
+                value=350.0,
+                step=10.0,
+            )
+
+        with c2:
+            vh_m3 = st.number_input(
+                "Volume habitable (m³)",
+                min_value=1.0,
+                value=600.0,
+                step=10.0,
+            )
 
     # ========================================================
     # SYSTÈME ACTUEL
