@@ -1336,13 +1336,9 @@ def build_inputs_from_form() -> ProjectInputs:
     # ========================================================
 
     st.header("4. Rafraîchissement")
-    st.write(
-        "Cette section est consacrée à l'utilisation de la pompe à chaleur "
-        "pour la climatisation."
-    )
 
     want_cooling = st.checkbox(
-        "Je souhaite utiliser la pompe à chaleur en mode climatisation",
+        "Modéliser un besoin de rafraîchissement",
         value=True,
     )
 
@@ -1360,7 +1356,7 @@ def build_inputs_from_form() -> ProjectInputs:
             default_surface = shab_m2 if shab_m2 is not None else 100.0
 
             surface_climatisee_m2 = st.number_input(
-                "Surface climatisée (m²)",
+                "Surface climatisée / rafraîchie (m²)",
                 min_value=0.0,
                 value=float(default_surface),
                 step=10.0,
@@ -1377,12 +1373,6 @@ def build_inputs_from_form() -> ProjectInputs:
                     "active_cooling": "Refroidissement actif",
                 }[x],
             )
-            st.caption({
-                "no_cooling": "Aucun besoin de climatisation n'est pris en compte dans le calcul.",
-                "free_cooling": "Refroidissement passif utilisant principalement la fraîcheur du sol, avec une consommation électrique très limitée.",
-                "hybrid": "Mode intermédiaire combinant refroidissement passif et appoint actif lorsque les besoins sont plus élevés.",
-                "active_cooling": "Mode climatisation active, plus puissant mais avec une consommation électrique plus importante.",
-            }[cooling_mode])
 
         c1, c2, c3 = st.columns(3)
 
@@ -1391,33 +1381,18 @@ def build_inputs_from_form() -> ProjectInputs:
                 "Surface vitrée",
                 ["faible", "moyen", "fort"],
             )
-            st.caption({
-                "faible": "Peu de fenêtres ou petites surfaces vitrées : les apports solaires restent limités.",
-                "moyen": "Surface vitrée classique pour un bâtiment courant.",
-                "fort": "Grandes baies vitrées ou nombreuses fenêtres : les apports solaires peuvent augmenter le besoin de froid.",
-            }[vitrage_level])
 
         with c2:
             solar_protection_level = st.selectbox(
                 "Protections solaires",
                 ["bonne", "moyenne", "faible"],
             )
-            st.caption({
-                "bonne": "Stores, volets ou protections extérieures efficaces limitant fortement les surchauffes.",
-                "moyenne": "Protections présentes mais partielles ou utilisées de manière variable.",
-                "faible": "Peu ou pas de protections solaires : le bâtiment est plus exposé aux surchauffes estivales.",
-            }[solar_protection_level])
 
         with c3:
             usage_level = st.selectbox(
                 "Occupation / apports",
                 ["faible", "normal", "eleve"],
             )
-            st.caption({
-                "faible": "Occupation limitée et peu d'appareils générant de la chaleur.",
-                "normal": "Usage courant du bâtiment, avec des apports internes moyens.",
-                "eleve": "Occupation importante, équipements nombreux ou activité générant davantage de chaleur.",
-            }[usage_level])
 
         night_ventilation = st.checkbox(
             "Ventilation nocturne possible",
@@ -1487,6 +1462,98 @@ def render_deterministic_comparison_block(central: dict) -> None:
     )
 
 
+
+def safe_series_sum(value: object) -> float | None:
+    """Somme une série ou une liste numérique en évitant de casser l'interface."""
+    try:
+        s = pd.Series(value).astype(float)
+        if s.empty:
+            return None
+        return float(s.sum())
+    except Exception:
+        return None
+
+
+def compute_co2_reduction_percent(central: dict) -> float | None:
+    """Calcule la réduction cumulée d'émissions de CO₂ du cas PAC par rapport au système actuel."""
+    emissions_actuel = central.get("emissions_actuel_series")
+    emissions_pac = central.get("emissions_pac_series")
+
+    total_actuel = safe_series_sum(emissions_actuel)
+    total_pac = safe_series_sum(emissions_pac)
+
+    if total_actuel is None or total_pac is None or total_actuel <= 0:
+        return None
+
+    return 100.0 * (total_actuel - total_pac) / total_actuel
+
+
+def render_public_simulation_block(label: str, data: dict) -> None:
+    """Affiche l'analyse avec incertitudes dans un langage plus accessible."""
+    unc = data.get("uncertainty", {})
+
+    if not isinstance(unc, dict) or not unc.get("available"):
+        reason = unc.get("reason", "non_disponible") if isinstance(unc, dict) else "non_disponible"
+        st.info(
+            "Le calcul avec variations possibles n'est pas disponible pour ce cas. "
+            f"Détail : {reason}."
+        )
+        return
+
+    st.subheader("Résultats avec variations possibles")
+    st.write(
+        "Dans cette partie, l'outil refait le calcul un grand nombre de fois en faisant varier "
+        "raisonnablement les coûts, les besoins du bâtiment, les performances de la pompe à chaleur "
+        "et les prix futurs de l'énergie. Cela permet de voir si le projet reste intéressant même "
+        "quand les conditions sont moins favorables."
+    )
+    st.info(
+        "Cette partie tient notamment compte de possibles hausses fortes du gaz ou du mazout, "
+        "qui ne sont pas incluses dans le cas simple présenté plus haut."
+    )
+
+    pb20 = unc.get("payback_p20")
+    pb50 = unc.get("payback_p50")
+    pb80 = unc.get("payback_p80")
+    prob_25 = unc.get("amortization_probability_life", unc.get("amortization_probability"))
+    prob_50 = unc.get("amortization_probability_extended")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Temps de retour le plus probable", format_payback(pb50))
+
+    if pb20 is not None and pb80 is not None:
+        c2.metric("Fourchette habituelle", f"{float(pb20):.1f} – {float(pb80):.1f} ans")
+    else:
+        c2.metric("Fourchette habituelle", "—")
+
+    c3.metric("Chance d'être rentabilisé en 25 ans", format_percent(prob_25, decimals=0))
+
+    c4, c5, c6 = st.columns(3)
+    c4.metric("Chance d'être rentabilisé en 50 ans", format_percent(prob_50, decimals=0))
+    c5.metric("Gain probable sur 25 ans", format_chf(unc.get("npv_p50"), decimals=0))
+    c6.metric("Économies probables la 1re année", format_chf(unc.get("annual_saving_year0_p50"), decimals=0))
+
+    if pb50 is not None and not bool(unc.get("payback_median_representative", False)):
+        st.warning(
+            "Dans beaucoup de calculs, l'installation n'est pas rentabilisée dans la période étudiée. "
+            "Le temps de retour affiché doit donc être lu avec prudence : regardez surtout la chance "
+            "d'être rentabilisé."
+        )
+
+    with st.expander("Voir les graphiques des variations possibles"):
+        st.caption(
+            "Ces graphiques montrent la dispersion des résultats obtenus lorsque les hypothèses varient. "
+            "Ils servent à visualiser si le résultat est stable ou très dépendant des conditions futures."
+        )
+        render_payback_simulation_chart(
+            unc=unc,
+            deterministic_payback=data.get("payback"),
+        )
+        render_npv_simulation_chart(
+            unc=unc,
+            deterministic_npv=data.get("npv"),
+        )
+
 # ============================================================
 # RÉSULTATS
 # ============================================================
@@ -1503,86 +1570,78 @@ def render_results(results: dict) -> None:
     if central is None and "Central" in scenarios:
         central = scenarios["Central"]
 
-    price_sensitivity = results.get("price_sensitivity", {})
-    parameter_sensitivity = results.get("parameter_sensitivity", [])
-
     st.header("5. Résultats")
 
+    # ========================================================
+    # RÉCAPITULATIF RAPIDE
+    # ========================================================
+
+    st.subheader("Récapitulatif rapide")
+    st.write(
+        "Voici les principaux ordres de grandeur estimés pour votre bâtiment et pour "
+        "l'installation d'une pompe à chaleur géothermique."
+    )
+
     c1, c2, c3 = st.columns(3)
-    c1.metric("Puissance de pointe", f"{chauffage['p_pointe_kw']:.1f} kW")
-    c2.metric("Besoin annuel chauffage", f"{chauffage['energie_annuelle_kwh']:.0f} kWh/an")
-    c3.metric("Besoin annuel de froid", f"{froid['q_froid_utile_kwh_an']:.0f} kWh/an")
+    c1.metric(
+        "Puissance estimée de la pompe à chaleur",
+        f"{chauffage['p_pointe_kw']:.1f} kW",
+        help="Puissance nécessaire pour couvrir les besoins de chauffage lors d'une période froide.",
+    )
+    c2.metric(
+        "Besoin annuel de chauffage",
+        f"{chauffage['energie_annuelle_kwh']:.0f} kWh/an",
+        help="Quantité de chaleur estimée pour chauffer le bâtiment sur une année.",
+    )
+    c3.metric(
+        "Besoin annuel de climatisation",
+        f"{froid['q_froid_utile_kwh_an']:.0f} kWh/an",
+        help="Quantité de froid estimée si la pompe à chaleur est utilisée pour climatiser le bâtiment.",
+    )
+
+    c4, c5, c6 = st.columns(3)
+    c4.metric(
+        "Coût d'installation estimé",
+        format_chf(pac["capex_brut"], decimals=0),
+        help="Estimation du coût total avant subventions.",
+    )
+    c5.metric(
+        "Subventions estimées",
+        format_chf(pac["subvention"], decimals=0),
+        help="Aides financières estimées selon le canton et le type de projet.",
+    )
+    c6.metric(
+        "Coût restant après subventions",
+        format_chf(pac["capex_net"], decimals=0),
+        help="Montant estimé restant à financer après déduction des subventions.",
+    )
 
     if froid.get("q_froid_utile_kwh_m2a") is not None:
         st.caption(
-            f"Besoin de froid surfacique estimé : "
-            f"{froid['q_froid_utile_kwh_m2a']:.1f} kWh/m².an"
+            f"Besoin de climatisation ramené à la surface : "
+            f"{froid['q_froid_utile_kwh_m2a']:.1f} kWh/m².an."
         )
-
-    # ========================================================
-    # LOCALISATION
-    # ========================================================
-
-    st.subheader("Localisation utilisée")
-
-    try:
-        postcode_meta = postcode_info(inputs.postcode)
-
-        st.write(
-            f"Code postal : **{postcode_meta['postcode']}** — "
-            f"Localité : **{postcode_meta['locality']}** — "
-            f"Canton : **{postcode_meta['canton_abbr']} ({postcode_meta['canton_name']})**"
-        )
-
-    except Exception:
-        st.write(
-            f"Code postal : **{inputs.postcode}** — "
-            f"Canton utilisé : **{inputs.canton}**"
-        )
-        st.warning(
-            "Impossible de retrouver la localité dans le fichier des codes postaux. "
-            "Le canton utilisé est celui présent dans les paramètres du projet."
-        )
-
-    # ========================================================
-    # STATION CLIMATIQUE
-    # ========================================================
-
-    st.subheader("Station climatique utilisée")
-
-    station_locality = station.get("input_locality", None)
-    station_canton = station.get("input_canton", None)
-
-    if station_locality and station_canton:
-        st.write(
-            f"Code postal climatique : {station['input_postcode']} "
-            f"({station_locality}, {station_canton})"
-        )
-    else:
-        st.write(f"Code postal climatique : {station.get('input_postcode', inputs.postcode)}")
-
-    st.write(
-        f"Station associée : **{station['station_name']}** "
-        f"à {station['distance_m']:.0f} m"
-    )
-
-    # ========================================================
-    # PAC
-    # ========================================================
-
-    st.subheader("PAC géothermique")
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("CAPEX brut", format_chf(pac["capex_brut"], decimals=0))
-    c2.metric("Subvention", format_chf(pac["subvention"], decimals=0))
-    c3.metric("CAPEX net", format_chf(pac["capex_net"], decimals=0))
 
     if inputs.project_type != "replacement":
         st.info(
-            "Les graphiques comparatifs coût/CO₂, le temps de retour et les analyses de sensibilité "
-            "s'affichent pour le cas de remplacement d'un système existant."
+            "Pour un nouveau bâtiment, l'outil affiche les besoins estimés et le coût de la PAC. "
+            "La comparaison économique complète s'affiche surtout pour le remplacement d'un chauffage existant."
         )
-        render_technical_details(chauffage, froid, pac)
+        with st.expander("Localisation et détails techniques"):
+            try:
+                postcode_meta = postcode_info(inputs.postcode)
+                st.write(
+                    f"Code postal : **{postcode_meta['postcode']}** — "
+                    f"Localité : **{postcode_meta['locality']}** — "
+                    f"Canton : **{postcode_meta['canton_abbr']} ({postcode_meta['canton_name']})**"
+                )
+            except Exception:
+                st.write(f"Code postal : **{inputs.postcode}** — Canton utilisé : **{inputs.canton}**")
+            st.write(
+                f"Station climatique associée : **{station['station_name']}** "
+                f"à {station['distance_m']:.0f} m"
+            )
+            render_technical_details(chauffage, froid, pac)
         return
 
     if central is None:
@@ -1590,95 +1649,119 @@ def render_results(results: dict) -> None:
         return
 
     # ========================================================
-    # RÉSULTAT DE RÉFÉRENCE : MONTE CARLO
+    # CAS SIMPLE / DÉTERMINISTE
     # ========================================================
 
-    st.subheader("Résultat économique de référence")
-    st.info(
-        "L'affichage privilégie maintenant le résultat probabiliste : la médiane Monte Carlo "
-        "est utilisée comme valeur de référence. Le scénario déterministe reste disponible "
-        "plus bas comme comparaison, mais il ne tient pas compte des chocs de prix fossiles."
+    st.subheader("Résultat avec les hypothèses principales")
+    st.write(
+        "Ce premier résultat compare la pompe à chaleur géothermique avec votre système actuel "
+        "en utilisant les hypothèses principales de prix et de performance. Il donne une lecture "
+        "simple du projet."
     )
-    render_uncertainty_block("Central", central)
+    st.warning(
+        "Ce cas ne prend pas en compte les fortes hausses possibles du gaz ou du mazout. "
+        "Ces variations sont étudiées dans la partie suivante."
+    )
 
-    # ========================================================
-    # COMPARAISON DÉTERMINISTE
-    # ========================================================
+    d1, d2, d3 = st.columns(3)
+    d1.metric(
+        "Temps estimé pour rentabiliser l'installation",
+        format_payback(central.get("payback")),
+        help="Durée nécessaire pour que les économies réalisées compensent le coût d'installation.",
+    )
+    d2.metric(
+        "Gain estimé sur la durée d'étude",
+        format_chf(central.get("npv"), decimals=0),
+        help="Bilan économique global sur la durée étudiée, en tenant compte du coût d'installation et des économies futures.",
+    )
+    d3.metric(
+        "Économies estimées la première année",
+        format_chf(central.get("economies_annuelles_year0"), decimals=0),
+        help="Différence estimée entre le coût annuel du système actuel et celui de la pompe à chaleur.",
+    )
 
-    render_deterministic_comparison_block(central)
-
-    # ========================================================
-    # GRAPHIQUE INTERACTIF DÉTERMINISTE
-    # ========================================================
-
-    st.subheader("Coûts cumulés actualisés — scénario déterministe interactif")
-    st.caption(
-        "Ce graphique reste basé sur le scénario déterministe central. "
-        "Il sert à comprendre les ordres de grandeur et l'effet de variations simples, "
-        "mais il ne remplace pas l'analyse Monte Carlo."
+    st.markdown("#### Coûts cumulés dans le temps")
+    st.write(
+        "Le graphique ci-dessous compare le coût cumulé du système actuel avec celui de la pompe "
+        "à chaleur. Vous pouvez tester rapidement l'effet d'une hausse ou d'une baisse des prix."
     )
 
     adjustments = render_interactive_adjustment_controls(results)
-
     render_interactive_cumulative_cost_chart(
         central=central,
         pac=pac,
         adjustments=adjustments,
     )
 
-    # ========================================================
-    # SENSIBILITÉ PARAMÈTRE PAR PARAMÈTRE
-    # ========================================================
-
-    st.subheader("Analyse de sensibilité par paramètre")
-
-    if parameter_sensitivity:
-        st.dataframe(
-            build_parameter_sensitivity_display(parameter_sensitivity),
-            use_container_width=True,
-        )
-        st.caption(
-            "Cette analyse fait varier un seul paramètre à la fois. "
-            "Elle permet d'identifier les hypothèses qui influencent le plus la rentabilité."
-        )
-    else:
-        st.info("Analyse de sensibilité par paramètre non disponible.")
-
-    # ========================================================
-    # SENSIBILITÉ AUX PRIX
-    # ========================================================
-
-    st.subheader("Sensibilité aux scénarios de prix")
-
-    if price_sensitivity:
-        st.dataframe(
-            build_price_sensitivity_display(price_sensitivity),
-            use_container_width=True,
-        )
-        st.caption(
-            "Ces scénarios modifient les trajectoires de prix de l'énergie. "
-            "Ils complètent l'analyse Monte Carlo centrale, mais ne la remplacent pas."
-        )
-    else:
-        st.info("Sensibilité aux scénarios de prix non disponible.")
-
-    # ========================================================
-    # ÉMISSIONS
-    # ========================================================
-
-    st.subheader("Émissions cumulées de CO₂ — cas central")
+    st.markdown("#### Réduction estimée des émissions de CO₂")
 
     if central.get("emissions_actuel_series") is not None and central.get("emissions_pac_series") is not None:
         fig_co2 = build_cumulative_emissions_bar_chart(
             central["emissions_actuel_series"],
             central["emissions_pac_series"],
-            "Central",
+            "Cas principal",
         )
         st.pyplot(fig_co2)
-    else:
-        st.info("Séries d'émissions non disponibles.")
 
-    render_technical_details(chauffage, froid, pac)
+        co2_reduction = compute_co2_reduction_percent(central)
+        if co2_reduction is not None:
+            st.success(
+                f"Réduction cumulée estimée des émissions : **{co2_reduction:.0f} %** "
+                "par rapport au système actuel."
+            )
+        else:
+            st.caption("La réduction des émissions n'a pas pu être calculée automatiquement.")
+    else:
+        st.info("Les séries d'émissions ne sont pas disponibles pour ce scénario.")
+
+    # ========================================================
+    # RÉSULTATS AVEC VARIATIONS POSSIBLES
+    # ========================================================
+
+    render_public_simulation_block("Central", central)
+
+    # ========================================================
+    # LOCALISATION ET DÉTAILS TECHNIQUES
+    # ========================================================
+
+    with st.expander("Localisation utilisée et détails techniques"):
+        st.subheader("Localisation utilisée")
+
+        try:
+            postcode_meta = postcode_info(inputs.postcode)
+            st.write(
+                f"Code postal : **{postcode_meta['postcode']}** — "
+                f"Localité : **{postcode_meta['locality']}** — "
+                f"Canton : **{postcode_meta['canton_abbr']} ({postcode_meta['canton_name']})**"
+            )
+        except Exception:
+            st.write(
+                f"Code postal : **{inputs.postcode}** — "
+                f"Canton utilisé : **{inputs.canton}**"
+            )
+            st.warning(
+                "Impossible de retrouver la localité dans le fichier des codes postaux. "
+                "Le canton utilisé est celui présent dans les paramètres du projet."
+            )
+
+        st.subheader("Station climatique utilisée")
+        station_locality = station.get("input_locality", None)
+        station_canton = station.get("input_canton", None)
+
+        if station_locality and station_canton:
+            st.write(
+                f"Code postal climatique : {station['input_postcode']} "
+                f"({station_locality}, {station_canton})"
+            )
+        else:
+            st.write(f"Code postal climatique : {station.get('input_postcode', inputs.postcode)}")
+
+        st.write(
+            f"Station associée : **{station['station_name']}** "
+            f"à {station['distance_m']:.0f} m"
+        )
+
+        render_technical_details(chauffage, froid, pac)
 
 
 def render_technical_details(chauffage: dict, froid: dict, pac: dict) -> None:
