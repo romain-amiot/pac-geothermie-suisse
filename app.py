@@ -57,7 +57,6 @@ from Fonctions.localisation import postcode_info
 
 st.set_page_config(
     page_title="Rentabilité PAC géothermique",
-    page_icon="🏠",
     layout="wide",
 )
 
@@ -1616,32 +1615,12 @@ def render_results(results: dict) -> None:
         help="Montant estimé restant à financer après déduction des subventions.",
     )
 
-    if froid.get("q_froid_utile_kwh_m2a") is not None:
-        st.caption(
-            f"Besoin de climatisation ramené à la surface : "
-            f"{froid['q_froid_utile_kwh_m2a']:.1f} kWh/m².an."
-        )
 
     if inputs.project_type != "replacement":
         st.info(
             "Pour un nouveau bâtiment, l'outil affiche les besoins estimés et le coût de la PAC. "
             "La comparaison économique complète s'affiche surtout pour le remplacement d'un chauffage existant."
         )
-        with st.expander("Localisation et détails techniques"):
-            try:
-                postcode_meta = postcode_info(inputs.postcode)
-                st.write(
-                    f"Code postal : **{postcode_meta['postcode']}** — "
-                    f"Localité : **{postcode_meta['locality']}** — "
-                    f"Canton : **{postcode_meta['canton_abbr']} ({postcode_meta['canton_name']})**"
-                )
-            except Exception:
-                st.write(f"Code postal : **{inputs.postcode}** — Canton utilisé : **{inputs.canton}**")
-            st.write(
-                f"Station climatique associée : **{station['station_name']}** "
-                f"à {station['distance_m']:.0f} m"
-            )
-            render_technical_details(chauffage, froid, pac)
         return
 
     if central is None:
@@ -1686,12 +1665,20 @@ def render_results(results: dict) -> None:
         "à chaleur. Vous pouvez tester rapidement l'effet d'une hausse ou d'une baisse des prix."
     )
 
-    adjustments = render_interactive_adjustment_controls(results)
+    if "interactive_adjustments" not in st.session_state:
+        st.session_state["interactive_adjustments"] = default_interactive_adjustments()
+
+    adjustments = st.session_state["interactive_adjustments"]
+    if "electricity_price_pct" not in adjustments:
+        adjustments["electricity_price_pct"] = int(adjustments.get("pac_annual_pct", 0))
+    adjustments.pop("pac_annual_pct", None)
+
     render_interactive_cumulative_cost_chart(
         central=central,
         pac=pac,
         adjustments=adjustments,
     )
+    render_interactive_adjustment_controls(results)
 
     st.markdown("#### Réduction estimée des émissions de CO₂")
 
@@ -1719,76 +1706,6 @@ def render_results(results: dict) -> None:
     # ========================================================
 
     render_public_simulation_block("Central", central)
-
-    # ========================================================
-    # LOCALISATION ET DÉTAILS TECHNIQUES
-    # ========================================================
-
-    with st.expander("Localisation utilisée et détails techniques"):
-        st.subheader("Localisation utilisée")
-
-        try:
-            postcode_meta = postcode_info(inputs.postcode)
-            st.write(
-                f"Code postal : **{postcode_meta['postcode']}** — "
-                f"Localité : **{postcode_meta['locality']}** — "
-                f"Canton : **{postcode_meta['canton_abbr']} ({postcode_meta['canton_name']})**"
-            )
-        except Exception:
-            st.write(
-                f"Code postal : **{inputs.postcode}** — "
-                f"Canton utilisé : **{inputs.canton}**"
-            )
-            st.warning(
-                "Impossible de retrouver la localité dans le fichier des codes postaux. "
-                "Le canton utilisé est celui présent dans les paramètres du projet."
-            )
-
-        st.subheader("Station climatique utilisée")
-        station_locality = station.get("input_locality", None)
-        station_canton = station.get("input_canton", None)
-
-        if station_locality and station_canton:
-            st.write(
-                f"Code postal climatique : {station['input_postcode']} "
-                f"({station_locality}, {station_canton})"
-            )
-        else:
-            st.write(f"Code postal climatique : {station.get('input_postcode', inputs.postcode)}")
-
-        st.write(
-            f"Station associée : **{station['station_name']}** "
-            f"à {station['distance_m']:.0f} m"
-        )
-
-        render_technical_details(chauffage, froid, pac)
-
-
-def render_technical_details(chauffage: dict, froid: dict, pac: dict) -> None:
-    st.subheader("Détail technique")
-    with st.expander("Voir le détail des calculs"):
-        st.write({
-            "postcode": chauffage.get("postcode"),
-            "hdd": chauffage.get("hdd"),
-            "dp_w_per_k": chauffage.get("dp_w_per_k"),
-            "t_ext_base": chauffage.get("t_ext_base"),
-            "cooling_hours": froid.get("cooling_hours"),
-            "cooling_degree_hours": froid.get("cooling_degree_hours"),
-            "cooling_mode_effective": froid.get("cooling_mode_effective"),
-            "typologie_calibration_froid": froid.get("typologie_calibration"),
-            "classe_climatique_froid": froid.get("climate_class"),
-            "q_ref_froid_kwh_m2a": froid.get("q_ref_kwh_m2a"),
-            "q_ref_source": froid.get("q_ref_source"),
-            "facteur_climat_froid": froid.get("f_climat"),
-            "facteur_vitrage": froid.get("f_vitrage"),
-            "facteur_solaire": froid.get("f_solaire"),
-            "facteur_usage": froid.get("f_usage"),
-            "facteur_night": froid.get("f_night"),
-            "facteur_mode": froid.get("f_mode"),
-            "om_pac": pac.get("om_annuel"),
-            "emissions_pac_kg": pac.get("emissions_totales_kg"),
-        })
-
 
 # ============================================================
 # MAIN
