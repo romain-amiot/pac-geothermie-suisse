@@ -1329,7 +1329,7 @@ def build_inputs_from_form() -> ProjectInputs:
         st.header("3. Système actuel")
         st.write(
             "Cette section concerne les paramètres de votre système de chauffage "
-            "actuellement utilisé installé."
+            "actuellement installé."
         )
 
         c1, c2 = st.columns(2)
@@ -1732,9 +1732,15 @@ def render_results(results: dict) -> None:
     m1, m2, m3 = st.columns(3)
     m1.metric("Temps de retour recalculé", format_payback(interactive_metrics.get("payback")))
     m2.metric("VAN recalculée", format_chf(interactive_metrics.get("van_recalculee"), decimals=0))
-    m3.metric("CAPEX net affiché", format_chf(interactive_metrics.get("capex_net"), decimals=0))
+    m3.metric("CAPEX recalculé", format_chf(interactive_metrics.get("capex_net"), decimals=0))
 
     st.markdown("#### Réduction estimée des émissions de CO₂")
+    st.write(
+        "Une pompe à chaleur géothermique permet de réduire grandement les émissions de CO2, "
+        "ce graphique représente la réduction estimée des émissions. Il ne prend pas en compte "
+        "les émissions liées à la fabrication et au transport du système de chauffage, seulement "
+        "les émissions liées au fonctionnement."
+    )
 
     if central.get("emissions_actuel_series") is not None and central.get("emissions_pac_series") is not None:
         fig_co2 = build_cumulative_emissions_bar_chart(
