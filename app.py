@@ -406,7 +406,6 @@ def render_interactive_adjustment_controls(results: dict) -> dict[str, int]:
 
     with c3:
         st.markdown("**CAPEX net**")
-        st.caption("CAPEX net après subvention")
         b1, b2 = st.columns(2)
         with b1:
             if st.button("-10 %", key="btn_capex_minus_10"):
@@ -1611,24 +1610,24 @@ def render_results(results: dict) -> None:
     c1.metric(
         "Puissance estimée de la pompe à chaleur",
         f"{chauffage['p_pointe_kw']:.1f} kW",
-        help="Puissance nécessaire pour couvrir les besoins de chauffage lors d'une période froide.",
     )
     c2.metric(
         "Besoin annuel de chauffage",
         f"{chauffage['energie_annuelle_kwh']:.0f} kWh/an",
-        help="Quantité de chaleur estimée pour chauffer le bâtiment sur une année.",
     )
     c3.metric(
         "Besoin annuel de climatisation",
         f"{froid['q_froid_utile_kwh_an']:.0f} kWh/an",
-        help="Quantité de froid estimée si la pompe à chaleur est utilisée pour climatiser le bâtiment.",
     )
 
     c4, c5, c6 = st.columns(3)
     c4.metric(
-        "Coût d'installation estimé",
+        "CAPEX brut estimé",
         format_chf(pac["capex_brut"], decimals=0),
-        help="Estimation du coût total avant subventions.",
+        help=(
+            "Le CAPEX représente l'investissement initial total, comprenant "
+            "le prix de la pompe et de son installation, avant déduction des subventions."
+        ),
     )
     c5.metric(
         "Subventions estimées",
@@ -1636,9 +1635,9 @@ def render_results(results: dict) -> None:
         help="Aides financières estimées selon le canton et le type de projet.",
     )
     c6.metric(
-        "Coût restant après subventions",
+        "CAPEX net estimé",
         format_chf(pac["capex_net"], decimals=0),
-        help="Montant estimé restant à financer après déduction des subventions.",
+        help="Coût de l'investissement initial estimé après déduction des subventions.",
     )
 
 
@@ -1660,8 +1659,7 @@ def render_results(results: dict) -> None:
     st.subheader("Résultat avec les hypothèses principales")
     st.write(
         "Ce premier résultat compare la pompe à chaleur géothermique avec votre système actuel "
-        "en utilisant les hypothèses principales de prix et de performance. Il donne une lecture "
-        "simple du projet."
+        "en utilisant les hypothèses principales de prix et de performance."
     )
     st.warning(
         "Ce cas ne prend pas en compte les fortes hausses possibles du gaz ou du mazout. "
@@ -1670,12 +1668,12 @@ def render_results(results: dict) -> None:
 
     d1, d2, d3 = st.columns(3)
     d1.metric(
-        "Temps estimé pour rentabiliser l'installation",
+        "Temps de retour estimé",
         format_payback(central.get("payback")),
         help="Durée nécessaire pour que les économies réalisées compensent le coût d'installation.",
     )
     d2.metric(
-        "Gain estimé sur la durée d'étude",
+        "VAN estimée",
         format_chf(central.get("npv"), decimals=0),
         help="Bilan économique global sur la durée étudiée, en tenant compte du coût d'installation et des économies futures.",
     )
