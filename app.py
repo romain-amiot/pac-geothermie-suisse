@@ -73,6 +73,7 @@ INTERACTIVE_ADJUSTMENT_STEP = 10
 INTERACTIVE_ADJUSTMENT_MIN = -30
 INTERACTIVE_ADJUSTMENT_MAX = 30
 DISCOUNT_RATE_DISPLAY = 0.03
+ECONOMIC_HORIZON_DISPLAY_YEARS = 25
 
 CANTONS_SWISS = [
     "Argovie",
@@ -452,6 +453,36 @@ def discounted_cumulative_series(
     return pd.Series(values, index=annual_costs.index)
 
 
+def first_n_years_series(series: pd.Series, n_years: int) -> pd.Series:
+    """Garde les n premières années d'une série de coûts.
+
+    Le cas déterministe du modèle est évalué sur l'horizon économique de 25 ans.
+    Le graphique interactif doit donc utiliser le même horizon pour que la VAN
+    affichée avec les boutons à 0 % corresponde à la VAN estimée plus haut.
+    """
+    s = pd.Series(series).copy()
+    s = pd.to_numeric(s, errors="coerce")
+    s = s.replace([float("inf"), float("-inf")], pd.NA)
+    s = s.interpolate(method="linear", limit_direction="both").ffill().bfill()
+    return s.astype(float).iloc[: int(n_years)].copy()
+
+
+def economic_horizon_years_from_results(central: dict) -> int:
+    """Retourne l'horizon économique utilisé pour la VAN.
+
+    On lit l'horizon dans le bloc d'incertitude quand il est disponible.
+    Sinon, on retombe sur la valeur du mémoire : 25 ans.
+    """
+    try:
+        unc = central.get("uncertainty", {})
+        horizon = int(unc.get("horizon_years", ECONOMIC_HORIZON_DISPLAY_YEARS))
+        if horizon > 0:
+            return horizon
+    except Exception:
+        pass
+    return ECONOMIC_HORIZON_DISPLAY_YEARS
+
+
 def local_discounted_payback(
     *,
     capex_net: float,
@@ -487,7 +518,7 @@ def render_interactive_cumulative_cost_chart(
         import plotly.graph_objects as go
     except ModuleNotFoundError:
         st.error("Plotly n'est pas installé. Lance : py -m pip install plotly")
-        return {"payback": None, "gain_cumule": None, "capex_net": None}
+        return {"payback": None, "van_recalculee": None, "capex_net": None}
 
     current_energy_factor = adjustment_factor(adjustments.get("current_energy_pct", 0))
     electricity_price_factor = adjustment_factor(adjustments.get("electricity_price_pct", 0))
@@ -545,6 +576,10 @@ def render_interactive_cumulative_cost_chart(
         cost_pac_base = pd.Series(central["cost_pac_total_series"]).astype(float)
         cost_pac = cost_pac_base * electricity_price_factor
 
+    horizon_years = economic_horizon_years_from_results(central)
+    cost_ref = first_n_years_series(cost_ref, horizon_years)
+    cost_pac = first_n_years_series(cost_pac, horizon_years)
+
     capex_net = float(pac["capex_net"]) * capex_factor
 
     cum_ref = discounted_cumulative_series(
@@ -568,7 +603,22 @@ def render_interactive_cumulative_cost_chart(
 
     total_ref = float(cum_ref.iloc[-1])
     total_pac = float(cum_pac.iloc[-1])
-    gain_cumule = total_ref - total_pac
+    van_recalculee = total_ref - total_pac
+
+    # Si tous les boutons sont neutres, la VAN recalculée doit être exactement
+    # la même que la VAN du cas déterministe affichée plus haut. On réutilise
+    # donc la valeur centrale déjà calculée par calcul_projet.py pour éviter
+    # tout écart d'arrondi ou d'horizon.
+    if (
+        int(adjustments.get("current_energy_pct", 0)) == 0
+        and int(adjustments.get("electricity_price_pct", 0)) == 0
+        and int(adjustments.get("capex_pct", 0)) == 0
+        and central.get("npv") is not None
+    ):
+        try:
+            van_recalculee = float(central["npv"])
+        except Exception:
+            pass
 
     fig = go.Figure()
 
@@ -641,7 +691,7 @@ def render_interactive_cumulative_cost_chart(
 
     return {
         "payback": payback,
-        "gain_cumule": gain_cumule,
+        "van_recalculee": van_recalculee,
         "capex_net": capex_net,
     }
 
@@ -1681,7 +1731,7 @@ def render_results(results: dict) -> None:
 
     m1, m2, m3 = st.columns(3)
     m1.metric("Temps de retour recalculé", format_payback(interactive_metrics.get("payback")))
-    m2.metric("Gain cumulé actualisé", format_chf(interactive_metrics.get("gain_cumule"), decimals=0))
+    m2.metric("VAN recalculée", format_chf(interactive_metrics.get("van_recalculee"), decimals=0))
     m3.metric("CAPEX net affiché", format_chf(interactive_metrics.get("capex_net"), decimals=0))
 
     st.markdown("#### Réduction estimée des émissions de CO₂")
