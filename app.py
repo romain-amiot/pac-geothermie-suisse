@@ -684,7 +684,7 @@ def render_payback_simulation_chart(
             float(deterministic_payback),
             linestyle="--",
             linewidth=2,
-            label=f"Déterministe sans chocs : {float(deterministic_payback):.1f} ans",
+            label=f"Cas général simplifié : {float(deterministic_payback):.1f} ans",
         )
 
     if pb50 is not None:
@@ -692,7 +692,7 @@ def render_payback_simulation_chart(
             float(pb50),
             linestyle="-",
             linewidth=2,
-            label=f"Référence MC : médiane {float(pb50):.1f} ans",
+            label=f"Temps de retour médian : {float(pb50):.1f} ans",
         )
 
     if pb20 is not None and pb80 is not None:
@@ -718,13 +718,6 @@ def render_payback_simulation_chart(
 
     st.pyplot(fig)
 
-    if prob_25 is not None or prob_50 is not None:
-        st.caption(
-            f"Probabilité d'amortissement : "
-            f"{format_percent(prob_25, decimals=0)} à 25 ans ; "
-            f"{format_percent(prob_50, decimals=0)} à 50 ans. "
-            "L'histogramme ne montre que les simulations amorties ; les simulations non amorties sont représentées par les probabilités."
-        )
 
 
 def render_npv_simulation_chart(
@@ -765,7 +758,7 @@ def render_npv_simulation_chart(
             float(deterministic_npv),
             linestyle="--",
             linewidth=2,
-            label=f"VAN déterministe sans chocs : {format_chf(deterministic_npv, decimals=0)}",
+            label=f"Cas général simplifié : {format_chf(deterministic_npv, decimals=0)}",
         )
 
     if npv_p50 is not None:
@@ -773,7 +766,7 @@ def render_npv_simulation_chart(
             float(npv_p50),
             linestyle="-",
             linewidth=2,
-            label=f"Référence MC : VAN médiane {format_chf(npv_p50, decimals=0)}",
+            label=f"VAN médiane : {format_chf(npv_p50, decimals=0)}",
         )
 
     if npv_p10 is not None and npv_p90 is not None:
@@ -1527,35 +1520,18 @@ def render_public_simulation_block(label: str, data: dict) -> None:
     st.subheader("Résultats avec variations possibles")
     st.write(
         "Dans cette partie, l'outil refait le calcul un grand nombre de fois en faisant varier "
-        "raisonnablement les coûts, les besoins du bâtiment, les performances de la pompe à chaleur "
-        "et les prix futurs de l'énergie. Cela permet de voir si le projet reste intéressant même "
-        "quand les conditions sont moins favorables."
-    )
-    st.info(
-        "Cette partie tient notamment compte de possibles hausses fortes du gaz ou du mazout, "
-        "qui ne sont pas incluses dans le cas simple présenté plus haut."
+        "raisonnablement les paramètres incertains. De plus, cette partie tient notamment compte "
+        "de possibles hausses fortes du gaz ou du mazout, qui ne sont pas incluses dans le "
+        "récapitulatif présenté plus haut."
     )
 
-    pb20 = unc.get("payback_p20")
     pb50 = unc.get("payback_p50")
-    pb80 = unc.get("payback_p80")
     prob_25 = unc.get("amortization_probability_life", unc.get("amortization_probability"))
-    prob_50 = unc.get("amortization_probability_extended")
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Temps de retour le plus probable", format_payback(pb50))
-
-    if pb20 is not None and pb80 is not None:
-        c2.metric("Fourchette habituelle", f"{float(pb20):.1f} – {float(pb80):.1f} ans")
-    else:
-        c2.metric("Fourchette habituelle", "—")
-
-    c3.metric("Chance d'être rentabilisé en 25 ans", format_percent(prob_25, decimals=0))
-
-    c4, c5, c6 = st.columns(3)
-    c4.metric("Chance d'être rentabilisé en 50 ans", format_percent(prob_50, decimals=0))
-    c5.metric("Gain probable sur 25 ans", format_chf(unc.get("npv_p50"), decimals=0))
-    c6.metric("Économies probables la 1re année", format_chf(unc.get("annual_saving_year0_p50"), decimals=0))
+    c1.metric("Temps de retour médian", format_payback(pb50))
+    c2.metric("Chance d'être rentabilisé en 25 ans", format_percent(prob_25, decimals=0))
+    c3.metric("VAN médiane", format_chf(unc.get("npv_p50"), decimals=0))
 
     if pb50 is not None and not bool(unc.get("payback_median_representative", False)):
         st.warning(
@@ -1566,8 +1542,7 @@ def render_public_simulation_block(label: str, data: dict) -> None:
 
     with st.expander("Voir les graphiques des variations possibles"):
         st.caption(
-            "Ces graphiques montrent la dispersion des résultats obtenus lorsque les hypothèses varient. "
-            "Ils servent à visualiser si le résultat est stable ou très dépendant des conditions futures."
+            "Ces graphiques montrent la dispersion des résultats obtenus lorsque les hypothèses varient."
         )
         render_payback_simulation_chart(
             unc=unc,
