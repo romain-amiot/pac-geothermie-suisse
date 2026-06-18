@@ -1336,9 +1336,13 @@ def build_inputs_from_form() -> ProjectInputs:
     # ========================================================
 
     st.header("4. Rafraîchissement")
+    st.write(
+        "Cette section est consacrée à l'utilisation de la pompe à chaleur "
+        "pour la climatisation."
+    )
 
     want_cooling = st.checkbox(
-        "Modéliser un besoin de rafraîchissement",
+        "Je souhaite utiliser la pompe à chaleur en mode climatisation",
         value=True,
     )
 
@@ -1356,7 +1360,7 @@ def build_inputs_from_form() -> ProjectInputs:
             default_surface = shab_m2 if shab_m2 is not None else 100.0
 
             surface_climatisee_m2 = st.number_input(
-                "Surface climatisée / rafraîchie (m²)",
+                "Surface climatisée (m²)",
                 min_value=0.0,
                 value=float(default_surface),
                 step=10.0,
@@ -1373,6 +1377,12 @@ def build_inputs_from_form() -> ProjectInputs:
                     "active_cooling": "Refroidissement actif",
                 }[x],
             )
+            st.caption({
+                "no_cooling": "Aucun besoin de climatisation n'est pris en compte dans le calcul.",
+                "free_cooling": "Refroidissement passif utilisant principalement la fraîcheur du sol, avec une consommation électrique très limitée.",
+                "hybrid": "Mode intermédiaire combinant refroidissement passif et appoint actif lorsque les besoins sont plus élevés.",
+                "active_cooling": "Mode climatisation active, plus puissant mais avec une consommation électrique plus importante.",
+            }[cooling_mode])
 
         c1, c2, c3 = st.columns(3)
 
@@ -1381,18 +1391,33 @@ def build_inputs_from_form() -> ProjectInputs:
                 "Surface vitrée",
                 ["faible", "moyen", "fort"],
             )
+            st.caption({
+                "faible": "Peu de fenêtres ou petites surfaces vitrées : les apports solaires restent limités.",
+                "moyen": "Surface vitrée classique pour un bâtiment courant.",
+                "fort": "Grandes baies vitrées ou nombreuses fenêtres : les apports solaires peuvent augmenter le besoin de froid.",
+            }[vitrage_level])
 
         with c2:
             solar_protection_level = st.selectbox(
                 "Protections solaires",
                 ["bonne", "moyenne", "faible"],
             )
+            st.caption({
+                "bonne": "Stores, volets ou protections extérieures efficaces limitant fortement les surchauffes.",
+                "moyenne": "Protections présentes mais partielles ou utilisées de manière variable.",
+                "faible": "Peu ou pas de protections solaires : le bâtiment est plus exposé aux surchauffes estivales.",
+            }[solar_protection_level])
 
         with c3:
             usage_level = st.selectbox(
                 "Occupation / apports",
                 ["faible", "normal", "eleve"],
             )
+            st.caption({
+                "faible": "Occupation limitée et peu d'appareils générant de la chaleur.",
+                "normal": "Usage courant du bâtiment, avec des apports internes moyens.",
+                "eleve": "Occupation importante, équipements nombreux ou activité générant davantage de chaleur.",
+            }[usage_level])
 
         night_ventilation = st.checkbox(
             "Ventilation nocturne possible",
