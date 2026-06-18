@@ -393,7 +393,6 @@ def render_interactive_adjustment_controls(results: dict) -> dict[str, int]:
 
     with c2:
         st.markdown("**Prix électricité**")
-        st.caption("Chauffage PAC, froid PAC et climatisation existante éventuelle")
         b1, b2 = st.columns(2)
         with b1:
             if st.button("-10 %", key="btn_electricity_price_minus_10"):
@@ -406,7 +405,7 @@ def render_interactive_adjustment_controls(results: dict) -> dict[str, int]:
         st.caption(f"Variation actuelle : {adj.get('electricity_price_pct', 0):+d} %")
 
     with c3:
-        st.markdown("**Investissement PAC**")
+        st.markdown("**CAPEX net**")
         st.caption("CAPEX net après subvention")
         b1, b2 = st.columns(2)
         with b1:
@@ -484,12 +483,12 @@ def render_interactive_cumulative_cost_chart(
     pac: dict,
     adjustments: dict,
     discount_rate: float = DISCOUNT_RATE_DISPLAY,
-) -> None:
+) -> dict:
     try:
         import plotly.graph_objects as go
     except ModuleNotFoundError:
         st.error("Plotly n'est pas installé. Lance : py -m pip install plotly")
-        return
+        return {"payback": None, "gain_cumule": None, "capex_net": None}
 
     current_energy_factor = adjustment_factor(adjustments.get("current_energy_pct", 0))
     electricity_price_factor = adjustment_factor(adjustments.get("electricity_price_pct", 0))
@@ -641,16 +640,11 @@ def render_interactive_cumulative_cost_chart(
 
     st.plotly_chart(fig, use_container_width=True)
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Temps de retour recalculé", format_payback(payback))
-    c2.metric("Gain cumulé actualisé", format_chf(gain_cumule, decimals=0))
-    c3.metric("CAPEX net affiché", format_chf(capex_net, decimals=0))
-
-    st.caption(
-        "Le bouton Prix électricité modifie uniquement les composantes électriques : "
-        "chauffage PAC, rafraîchissement PAC et climatisation existante éventuelle du système actuel. "
-        "La maintenance n'est pas multipliée par ce facteur."
-    )
+    return {
+        "payback": payback,
+        "gain_cumule": gain_cumule,
+        "capex_net": capex_net,
+    }
 
 
 # ============================================================
@@ -1335,9 +1329,12 @@ def build_inputs_from_form() -> ProjectInputs:
     # ========================================================
 
     st.header("4. Rafraîchissement")
+    st.write(
+        "Cette section est consacrée à l'utilisation de la pompe à chaleur pour la climatisation."
+    )
 
     want_cooling = st.checkbox(
-        "Modéliser un besoin de rafraîchissement",
+        "Je souhaite utiliser la pompe à chaleur en mode climatisation",
         value=True,
     )
 
@@ -1349,13 +1346,38 @@ def build_inputs_from_form() -> ProjectInputs:
     night_ventilation = False
 
     if want_cooling:
+        cooling_mode_descriptions = {
+            "no_cooling": "Aucun besoin de climatisation n'est ajouté au calcul.",
+            "free_cooling": "La fraîcheur du sol est utilisée au maximum, avec une consommation électrique très limitée.",
+            "hybrid": "Le système combine le refroidissement passif et un appoint actif lorsque les besoins sont plus importants.",
+            "active_cooling": "La pompe à chaleur fonctionne activement en mode climatisation, avec une consommation électrique plus élevée.",
+        }
+
+        vitrage_descriptions = {
+            "faible": "Peu de surfaces vitrées : les apports solaires restent limités.",
+            "moyen": "Surface vitrée standard pour ce type de bâtiment.",
+            "fort": "Grandes surfaces vitrées : les apports solaires peuvent augmenter les besoins de climatisation.",
+        }
+
+        solar_descriptions = {
+            "bonne": "Protections efficaces, par exemple stores extérieurs, volets ou brise-soleil.",
+            "moyenne": "Protections partielles ou utilisées de manière irrégulière.",
+            "faible": "Peu ou pas de protections solaires efficaces.",
+        }
+
+        usage_descriptions = {
+            "faible": "Occupation limitée et peu d'appareils produisant de la chaleur.",
+            "normal": "Usage standard du bâtiment.",
+            "eleve": "Occupation importante ou nombreux apports internes, par exemple équipements, éclairage ou informatique.",
+        }
+
         c1, c2 = st.columns(2)
 
         with c1:
             default_surface = shab_m2 if shab_m2 is not None else 100.0
 
             surface_climatisee_m2 = st.number_input(
-                "Surface climatisée / rafraîchie (m²)",
+                "Surface climatisée (m²)",
                 min_value=0.0,
                 value=float(default_surface),
                 step=10.0,
@@ -1372,6 +1394,7 @@ def build_inputs_from_form() -> ProjectInputs:
                     "active_cooling": "Refroidissement actif",
                 }[x],
             )
+            st.caption(cooling_mode_descriptions[cooling_mode])
 
         c1, c2, c3 = st.columns(3)
 
@@ -1380,18 +1403,21 @@ def build_inputs_from_form() -> ProjectInputs:
                 "Surface vitrée",
                 ["faible", "moyen", "fort"],
             )
+            st.caption(vitrage_descriptions[vitrage_level])
 
         with c2:
             solar_protection_level = st.selectbox(
                 "Protections solaires",
                 ["bonne", "moyenne", "faible"],
             )
+            st.caption(solar_descriptions[solar_protection_level])
 
         with c3:
             usage_level = st.selectbox(
                 "Occupation / apports",
                 ["faible", "normal", "eleve"],
             )
+            st.caption(usage_descriptions[usage_level])
 
         night_ventilation = st.checkbox(
             "Ventilation nocturne possible",
@@ -1673,12 +1699,17 @@ def render_results(results: dict) -> None:
         adjustments["electricity_price_pct"] = int(adjustments.get("pac_annual_pct", 0))
     adjustments.pop("pac_annual_pct", None)
 
-    render_interactive_cumulative_cost_chart(
+    interactive_metrics = render_interactive_cumulative_cost_chart(
         central=central,
         pac=pac,
         adjustments=adjustments,
     )
     render_interactive_adjustment_controls(results)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Temps de retour recalculé", format_payback(interactive_metrics.get("payback")))
+    m2.metric("Gain cumulé actualisé", format_chf(interactive_metrics.get("gain_cumule"), decimals=0))
+    m3.metric("CAPEX net affiché", format_chf(interactive_metrics.get("capex_net"), decimals=0))
 
     st.markdown("#### Réduction estimée des émissions de CO₂")
 
