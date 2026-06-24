@@ -67,6 +67,7 @@ from models import ProjectInputs
 from Fonctions.puissance_pointe import calcul_pointe_et_energie_annuelle
 from Fonctions.rentabilite import (
     gshp_capex_net_after_subsidy,
+    estimate_geothermal_subsidy_chf,
     couts_annuels_gshp_zuberi,
     load_price_path_electricity_ttc_by_canton,
     load_price_path_fuel,
@@ -1222,7 +1223,12 @@ def estimate_cooling_need_kwh(
 
 def get_uncertainty_config(*, inputs: ProjectInputs, froid: dict[str, Any], scenario_label: str) -> dict[str, Any]:
     cfg = UNCERTAINTY_DEFAULTS.copy()
-    if inputs.sdep_mode == "Saisie directe":
+    if bool(getattr(inputs, "technical_quote_mode", False)):
+        # Les besoins proviennent directement d'un devis ou d'une étude technique.
+        # Une incertitude résiduelle est conservée, mais elle est plus faible que
+        # celle d'une estimation géométrique simplifiée.
+        cfg["heating_need_sigma"] = 0.08
+    elif inputs.sdep_mode == "Saisie directe":
         cfg["heating_need_sigma"] = 0.10
     elif inputs.sdep_mode == "Estimation par périmètre":
         cfg["heating_need_sigma"] = 0.15
@@ -1232,6 +1238,8 @@ def get_uncertainty_config(*, inputs: ProjectInputs, froid: dict[str, Any], scen
         cfg["heating_need_sigma"] = 0.22
     typ = str(froid.get("typologie_calibration", "mixte"))
     cfg["cooling_need_sigma"] = COOLING_SIGMA_BY_TYPOLOGY.get(typ, 0.35)
+    if bool(getattr(inputs, "technical_quote_mode", False)):
+        cfg["cooling_need_sigma"] = 0.12 if inputs.want_cooling else 0.0
     cooling_mode = str(froid.get("cooling_mode_effective", inputs.cooling_mode))
     if cooling_mode == "active_cooling":
         cfg["cooling_need_sigma"] *= 0.90
@@ -1262,7 +1270,10 @@ def compute_confidence_level(*, inputs: ProjectInputs, froid: dict[str, Any]) ->
     score = 0
     reasons_positive: list[str] = []
     reasons_negative: list[str] = []
-    if inputs.sdep_mode == "Saisie directe":
+    if bool(getattr(inputs, "technical_quote_mode", False)):
+        score += 2
+        reasons_positive.append("puissance et besoin de chauffage issus du devis")
+    elif inputs.sdep_mode == "Saisie directe":
         score += 2
         reasons_positive.append("Sdép et Vh saisis directement")
     elif inputs.sdep_mode == "Estimation par périmètre":
@@ -1273,7 +1284,10 @@ def compute_confidence_level(*, inputs: ProjectInputs, froid: dict[str, Any]) ->
     else:
         reasons_negative.append("géométrie estimée par typologie")
     qref_source = str(froid.get("q_ref_source", ""))
-    if qref_source and not qref_source.startswith("fallback"):
+    if qref_source == "saisie_devis":
+        score += 2
+        reasons_positive.append("besoin de froid renseigné directement")
+    elif qref_source and not qref_source.startswith("fallback"):
         score += 2
         reasons_positive.append("q_ref froid issu du fichier de calibration")
     else:
@@ -1312,11 +1326,38 @@ def compute_economic_indicators(
     discount_rate: float = UNCERTAINTY_DISCOUNT_RATE,
     payback_max_years: int = UNCERTAINTY_PAYBACK_MAX_YEARS,
 ) -> dict[str, Any]:
-    if cost_ref_series is None or cost_pac_series is None:
-        return {"cout_ref_year0": None, "cout_pac_year0": None, "economies_year0": None, "payback": None, "npv": None}
+    """
+    Calcule les coûts de première année et, lorsqu'un système de référence
+    existe, les indicateurs comparatifs de rentabilité.
+
+    Pour un nouveau bâtiment, cost_ref_series est volontairement absente.
+    Le coût de fonctionnement de la PAC doit néanmoins rester disponible.
+    """
+    cout_pac_year0 = None
+    if cost_pac_series is not None and len(cost_pac_series) > 0:
+        cout_pac_year0 = float(cost_pac_series.iloc[0])
+
+    if cost_ref_series is None or len(cost_ref_series) == 0:
+        return {
+            "cout_ref_year0": None,
+            "cout_pac_year0": cout_pac_year0,
+            "economies_year0": None,
+            "payback": None,
+            "npv": None,
+        }
+
+    if cout_pac_year0 is None:
+        return {
+            "cout_ref_year0": float(cost_ref_series.iloc[0]),
+            "cout_pac_year0": None,
+            "economies_year0": None,
+            "payback": None,
+            "npv": None,
+        }
+
     cout_ref_year0 = float(cost_ref_series.iloc[0])
-    cout_pac_year0 = float(cost_pac_series.iloc[0])
     economies_year0 = cout_ref_year0 - cout_pac_year0
+
     res_pb_standard = payback_discounted_from_cashflows(
         capex_chf=capex_net,
         cost_ref=cost_ref_series,
@@ -1324,6 +1365,7 @@ def compute_economic_indicators(
         discount_rate=discount_rate,
     )
     npv = res_pb_standard.get("npv")
+
     cost_ref_extended = _series_first_n_years(cost_ref_series, payback_max_years)
     cost_pac_extended = _series_first_n_years(cost_pac_series, payback_max_years)
     payback_extended = discounted_payback_from_annual_savings(
@@ -1331,7 +1373,14 @@ def compute_economic_indicators(
         annual_savings=cost_ref_extended - cost_pac_extended,
         discount_rate=discount_rate,
     )
-    return {"cout_ref_year0": cout_ref_year0, "cout_pac_year0": cout_pac_year0, "economies_year0": economies_year0, "payback": payback_extended, "npv": npv}
+
+    return {
+        "cout_ref_year0": cout_ref_year0,
+        "cout_pac_year0": cout_pac_year0,
+        "economies_year0": economies_year0,
+        "payback": payback_extended,
+        "npv": npv,
+    }
 
 
 def monte_carlo_project_uncertainty(
@@ -1670,27 +1719,134 @@ def evaluer_projet(inputs: ProjectInputs) -> dict[str, Any]:
     is_replacement = project_requires_reference_system(inputs.project_type)
     building_type_price = _get_price_building_type(inputs.building_type_key)
     station_info = nearest_station_for_postcode(inputs.postcode)
-    res_ch = calcul_pointe_et_energie_annuelle(postcode=inputs.postcode, ubat=inputs.ubat, sdep_m2=float(inputs.sdep_m2), ventilation_r=inputs.ventilation_r, vh_m3=float(inputs.vh_m3))
-    besoin_total = float(res_ch["energie_annuelle_kwh"])
-    p_max_kw = float(res_ch["p_pointe_kw"])
+    technical_quote_mode = bool(getattr(inputs, "technical_quote_mode", False))
+
+    if technical_quote_mode:
+        besoin_total = float(getattr(inputs, "direct_heating_need_kwh"))
+        p_max_kw = float(getattr(inputs, "direct_pac_power_kw"))
+        direct_cop = float(getattr(inputs, "direct_cop"))
+
+        if besoin_total <= 0:
+            raise ValueError("Le besoin annuel de chauffage renseigné doit être positif.")
+        if p_max_kw <= 0:
+            raise ValueError("La puissance de la PAC renseignée doit être positive.")
+        if direct_cop <= 0:
+            raise ValueError("Le COP renseigné doit être positif.")
+
+        res_ch = {
+            "postcode": inputs.postcode,
+            "p_pointe_kw": p_max_kw,
+            "energie_annuelle_kwh": besoin_total,
+            "source": "saisie_devis",
+        }
+    else:
+        res_ch = calcul_pointe_et_energie_annuelle(
+            postcode=inputs.postcode,
+            ubat=inputs.ubat,
+            sdep_m2=float(inputs.sdep_m2),
+            ventilation_r=inputs.ventilation_r,
+            vh_m3=float(inputs.vh_m3),
+        )
+        besoin_total = float(res_ch["energie_annuelle_kwh"])
+        p_max_kw = float(res_ch["p_pointe_kw"])
+        direct_cop = None
+
     cooling_hours = cooling_hours_for_postcode(inputs.postcode)
     cooling_degree_hours = cooling_degree_hours_for_postcode(inputs.postcode)
     effective_cooling_mode = inputs.cooling_mode
     if not inputs.want_cooling:
         effective_cooling_mode = "no_cooling"
-    cool_res = estimate_cooling_need_kwh(building_type_key=inputs.building_type_key, cooling_mode=effective_cooling_mode, surface_climatisee_m2=inputs.surface_climatisee_m2, cooling_degree_hours=cooling_degree_hours, vitrage_level=inputs.vitrage_level, solar_protection_level=inputs.solar_protection_level, usage_level=inputs.usage_level, night_ventilation=inputs.night_ventilation, station_info=station_info)
-    energie_froid_utile_kwh = float(cool_res["q_froid_utile_kwh_an"])
-    co2_factor_elec_kg_kwh = g_per_kwh_to_kg_per_kwh(CO2_FACTORS_G_PER_KWH["Électricité (réseau)"])
+
+    if technical_quote_mode:
+        energie_froid_utile_kwh = max(
+            0.0,
+            float(getattr(inputs, "direct_cooling_need_kwh", 0.0)),
+        )
+        if energie_froid_utile_kwh <= 0:
+            effective_cooling_mode = "no_cooling"
+
+        spf_froid = COOLING_SPF_BY_MODE.get(effective_cooling_mode)
+        conso_elec_clim = (
+            energie_froid_utile_kwh / float(spf_froid)
+            if spf_froid is not None and spf_froid > 0
+            else 0.0
+        )
+        cool_res = {
+            "typologie_calibration": normalize_calibration_typology(inputs.building_type_key),
+            "climate_class": "saisie_devis",
+            "climate_class_source": "saisie_devis",
+            "station_name": station_name_from_station_info(station_info),
+            "q_ref_kwh_m2a": None,
+            "q_ref_source": "saisie_devis",
+            "f_climat": 1.0,
+            "f_climat_source": "saisie_devis",
+            "f_vitrage": 1.0,
+            "f_solaire": 1.0,
+            "f_usage": 1.0,
+            "f_night": 1.0,
+            "f_night_source": "saisie_devis",
+            "f_mode": 1.0,
+            "q_froid_utile_kwh_an": energie_froid_utile_kwh,
+            "q_froid_utile_kwh_m2a": None,
+            "spf_froid": spf_froid,
+            "conso_elec_clim_kwh_an": conso_elec_clim,
+        }
+    else:
+        cool_res = estimate_cooling_need_kwh(
+            building_type_key=inputs.building_type_key,
+            cooling_mode=effective_cooling_mode,
+            surface_climatisee_m2=inputs.surface_climatisee_m2,
+            cooling_degree_hours=cooling_degree_hours,
+            vitrage_level=inputs.vitrage_level,
+            solar_protection_level=inputs.solar_protection_level,
+            usage_level=inputs.usage_level,
+            night_ventilation=inputs.night_ventilation,
+            station_info=station_info,
+        )
+        energie_froid_utile_kwh = float(cool_res["q_froid_utile_kwh_an"])
+
+    co2_factor_elec_kg_kwh = g_per_kwh_to_kg_per_kwh(
+        CO2_FACTORS_G_PER_KWH["Électricité (réseau)"]
+    )
     energie_label = None
     rendement_actuel = None
     co2_factor_actuel = None
     if is_replacement:
         energie_label = inputs.current_energy
         rendement_actuel = float(inputs.current_efficiency)
-        co2_factor_actuel = g_per_kwh_to_kg_per_kwh(CO2_FACTORS_G_PER_KWH[energie_label])
+        co2_factor_actuel = g_per_kwh_to_kg_per_kwh(
+            CO2_FACTORS_G_PER_KWH[energie_label]
+        )
+
     om_pac_chf_per_year = annual_om_cost_chf("PAC géothermique", p_max_kw)
-    gshp = couts_annuels_gshp_zuberi(p_nom_kw=p_max_kw, chaleur_utile_kwh=besoin_total, prix_elec_chf_kwh=0.25, om_chf_per_year=om_pac_chf_per_year)
-    capex_brut, subvention_pac, capex_net = gshp_capex_net_after_subsidy(p_nom_kw=p_max_kw, canton=inputs.canton, project_type=inputs.project_type, current_energy_label=energie_label)
+    gshp = couts_annuels_gshp_zuberi(
+        p_nom_kw=p_max_kw,
+        chaleur_utile_kwh=besoin_total,
+        prix_elec_chf_kwh=0.25,
+        spf=direct_cop if technical_quote_mode else 5.0,
+        om_chf_per_year=om_pac_chf_per_year,
+    )
+
+    if technical_quote_mode:
+        capex_brut = float(getattr(inputs, "direct_capex_chf"))
+        if capex_brut <= 0:
+            raise ValueError("Le CAPEX renseigné doit être positif.")
+
+        subvention_pac = estimate_geothermal_subsidy_chf(
+            canton=inputs.canton,
+            p_nom_kw=p_max_kw,
+            project_type=inputs.project_type,
+            capex_chf=capex_brut,
+            current_energy_label=energie_label,
+        )
+        capex_net = max(0.0, capex_brut - subvention_pac)
+    else:
+        capex_brut, subvention_pac, capex_net = gshp_capex_net_after_subsidy(
+            p_nom_kw=p_max_kw,
+            canton=inputs.canton,
+            project_type=inputs.project_type,
+            current_energy_label=energie_label,
+        )
     def load_price_pair(electricity_scenario: str, fuel_scenario: str) -> tuple[pd.Series, pd.Series | None]:
         p_elec_local = load_price_path_electricity_ttc_by_canton(
             SCEN_ELEC_CSV,
@@ -1821,10 +1977,12 @@ def evaluer_projet(inputs: ProjectInputs) -> dict[str, Any]:
         "pac": {
             "p_nom_kw": p_max_kw,
             "spf": float(gshp.spf),
+            "technical_quote_mode": technical_quote_mode,
             "capex_brut": capex_brut,
             "subvention": subvention_pac,
             "capex_net": capex_net,
             "cout_annuel_total_annee_0": central_payload["cout_pac_total_year0"],
+            "cout_fonctionnement_pac_premiere_annee": central_payload["cout_pac_total_year0"],
             "om_annuel": float(gshp.om_chf_per_year),
             "emissions_totales_kg": float(central_payload["emissions_pac_series"].iloc[0]) if central_payload.get("emissions_pac_series") is not None else None,
         },

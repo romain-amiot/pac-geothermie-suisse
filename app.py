@@ -1021,6 +1021,7 @@ def clear_results_after_project_type_change() -> None:
     correspondant encore au projet précédent.
     """
     st.session_state["results"] = None
+    st.session_state["results_mode"] = None
     reset_interactive_adjustments()
 
 
@@ -1542,6 +1543,267 @@ def build_inputs_from_form() -> ProjectInputs:
 
 
 
+
+def clear_results_after_quote_type_change() -> None:
+    """Efface les résultats lorsqu'on change le type du projet avec devis."""
+    st.session_state["results"] = None
+    st.session_state["results_mode"] = None
+    reset_interactive_adjustments()
+
+
+def build_quote_inputs_from_form() -> ProjectInputs:
+    """
+    Formulaire destiné aux utilisateurs qui disposent déjà d'un devis ou
+    d'une étude technique.
+
+    Les valeurs nécessaires au dimensionnement sont saisies directement :
+    puissance de la PAC, COP, CAPEX, besoins annuels de chauffage et de froid.
+    Les entrées géométriques et thermiques utilisées pour les estimer ne sont
+    donc pas affichées dans cet onglet.
+    """
+    project_type_label = st.radio(
+        "Type de projet",
+        options=["Remplacer un ancien chauffage", "Nouveau bâtiment"],
+        index=0,
+        horizontal=True,
+        key="quote_project_type_selector",
+        on_change=clear_results_after_quote_type_change,
+    )
+    project_type = (
+        "replacement"
+        if project_type_label == "Remplacer un ancien chauffage"
+        else "new_building"
+    )
+
+    st.write(
+        "Cet onglet utilise directement les valeurs présentes dans votre devis "
+        "ou votre étude technique. Les trajectoires futures des prix de l'énergie, "
+        "les coûts de fonctionnement, la rentabilité et les graphiques sont ensuite "
+        "calculés avec la même méthode que dans le projet sans devis."
+    )
+
+    postcode_valid = False
+    postcode_meta = None
+    canton = "Vaud"
+
+    # ========================================================
+    # LOCALISATION ET TYPE DE BÂTIMENT
+    # ========================================================
+    st.header("1. Localisation et type de bâtiment")
+
+    postcode = st.text_input(
+        "Code postal du bâtiment",
+        value="1000",
+        key="quote_postcode",
+    )
+
+    if postcode.strip():
+        try:
+            postcode_meta = postcode_info(postcode)
+            canton = postcode_meta["canton_name"]
+            postcode_valid = True
+            st.success(
+                f"Localisation reconnue : {postcode_meta['locality']} — "
+                f"{postcode_meta['canton_abbr']} ({postcode_meta['canton_name']})"
+            )
+        except ValueError as e:
+            st.error(str(e))
+        except Exception as e:
+            st.error(
+                "Erreur lors de la lecture de la base des codes postaux. "
+                f"Détail : {e}"
+            )
+    else:
+        st.error("Code postal invalide. Veuillez vérifier votre saisie.")
+
+    st.session_state["postcode_valid_quote"] = postcode_valid
+    st.session_state["postcode_meta_quote"] = postcode_meta
+
+    building_type_label = st.selectbox(
+        "Typologie du bâtiment",
+        options=[label for _, label in TYPOLOGIES_MENU],
+        key="quote_building_type",
+    )
+    building_type_key = next(
+        key for key, label in TYPOLOGIES_MENU if label == building_type_label
+    )
+
+    # ========================================================
+    # DONNÉES TECHNIQUES DU DEVIS
+    # ========================================================
+    st.header("2. Données techniques du devis")
+    st.caption(
+        "Le CAPEX saisi correspond au coût total du devis avant les éventuelles "
+        "subventions. Pour un remplacement éligible, les subventions sont estimées "
+        "avec la même méthode que dans le projet sans devis."
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        direct_pac_power_kw = st.number_input(
+            "Puissance de la pompe à chaleur (kW)",
+            min_value=0.1,
+            value=20.0,
+            step=1.0,
+            key="quote_pac_power_kw",
+        )
+    with c2:
+        direct_cop = st.number_input(
+            "COP de la pompe à chaleur",
+            min_value=1.0,
+            max_value=10.0,
+            value=5.0,
+            step=0.1,
+            key="quote_cop",
+        )
+    with c3:
+        direct_capex_chf = st.number_input(
+            "CAPEX total du devis avant subventions (CHF)",
+            min_value=1.0,
+            value=75_000.0,
+            step=1_000.0,
+            key="quote_capex_chf",
+        )
+
+    c4, c5 = st.columns(2)
+    with c4:
+        direct_heating_need_kwh = st.number_input(
+            "Besoin annuel de chauffage du bâtiment (kWh/an)",
+            min_value=1.0,
+            value=30_000.0,
+            step=1_000.0,
+            key="quote_heating_need_kwh",
+        )
+    with c5:
+        want_cooling = st.checkbox(
+            "Le projet prévoit un rafraîchissement avec la PAC",
+            value=False,
+            key="quote_want_cooling",
+        )
+
+    direct_cooling_need_kwh = 0.0
+    cooling_mode = "no_cooling"
+
+    if want_cooling:
+        c6, c7 = st.columns(2)
+        with c6:
+            direct_cooling_need_kwh = st.number_input(
+                "Besoin annuel de climatisation du bâtiment (kWh/an)",
+                min_value=0.0,
+                value=5_000.0,
+                step=500.0,
+                key="quote_cooling_need_kwh",
+            )
+        with c7:
+            cooling_mode = st.selectbox(
+                "Mode de refroidissement prévu",
+                options=["free_cooling", "hybrid", "active_cooling"],
+                format_func=lambda x: {
+                    "free_cooling": "Free cooling / passif",
+                    "hybrid": "Hybride",
+                    "active_cooling": "Refroidissement actif",
+                }[x],
+                key="quote_cooling_mode",
+            )
+
+    # ========================================================
+    # SYSTÈME ACTUEL
+    # ========================================================
+    current_energy = None
+    current_efficiency = None
+    has_existing_ac = False
+    eer_current_ac = None
+
+    if project_type == "replacement":
+        st.header("3. Système actuel")
+        st.write(
+            "Cette section concerne les paramètres du système de chauffage "
+            "actuellement installé."
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            current_energy = st.selectbox(
+                "Énergie du système actuel",
+                options=list(ENERGY_CHOICES.keys()),
+                key="quote_current_energy",
+            )
+        with c2:
+            current_efficiency = st.number_input(
+                "Rendement actuel",
+                min_value=0.1,
+                max_value=1.2,
+                value=float(RENDEMENTS_STANDARDS[current_energy]),
+                step=0.01,
+                key="quote_current_efficiency",
+            )
+            st.caption(
+                "Si vous ne connaissez pas le rendement de votre système de chauffage, "
+                "laissez la valeur proposée par défaut."
+            )
+
+        has_existing_ac = st.checkbox(
+            "Le bâtiment a déjà une climatisation",
+            value=False,
+            key="quote_has_existing_ac",
+        )
+
+        if has_existing_ac:
+            eer_current_ac = st.number_input(
+                "Rendement de la clim actuelle",
+                min_value=0.5,
+                value=EER_CLIM_ACTUEL_DEFAULT,
+                step=0.1,
+                key="quote_eer_current_ac",
+            )
+
+    # Valeurs techniques neutres : elles satisfont la structure ProjectInputs,
+    # mais le moteur ne les utilise pas en mode devis.
+    inputs = ProjectInputs(
+        project_type=project_type,
+        canton=canton,
+        postcode=postcode,
+        building_type_key=building_type_key,
+        ubat=0.75,
+        ventilation_r=DEFAULT_VENTILATION_R,
+        sdep_mode="Données techniques du devis",
+        sdep_m2=1.0,
+        vh_m3=1.0,
+        shab_m2=None,
+        niveaux=None,
+        perimetre_m=None,
+        hauteur_m=DEFAULT_CEILING_HEIGHT_M,
+        toiture_exposee=True,
+        plancher_expose=True,
+        forme_generale=None,
+        mitoyennete=None,
+        longueur_m=None,
+        largeur_m=None,
+        current_energy=current_energy,
+        current_efficiency=current_efficiency,
+        want_cooling=bool(want_cooling and direct_cooling_need_kwh > 0),
+        surface_climatisee_m2=(1.0 if direct_cooling_need_kwh > 0 else 0.0),
+        cooling_mode=cooling_mode,
+        vitrage_level="moyen",
+        solar_protection_level="moyenne",
+        usage_level="normal",
+        night_ventilation=False,
+        has_existing_ac=has_existing_ac,
+        eer_current_ac=eer_current_ac,
+    )
+
+    # ProjectInputs est une dataclass classique, sans slots : ces attributs
+    # supplémentaires sont lus uniquement par services/calcul_projet.py.
+    inputs.technical_quote_mode = True
+    inputs.direct_capex_chf = float(direct_capex_chf)
+    inputs.direct_cop = float(direct_cop)
+    inputs.direct_pac_power_kw = float(direct_pac_power_kw)
+    inputs.direct_heating_need_kwh = float(direct_heating_need_kwh)
+    inputs.direct_cooling_need_kwh = float(direct_cooling_need_kwh)
+
+    return inputs
+
+
 def render_deterministic_comparison_block(central: dict) -> None:
     """Affiche le scénario déterministe comme comparaison secondaire."""
     st.subheader("Comparaison : scénario déterministe sans chocs fossiles")
@@ -1656,7 +1918,11 @@ def render_results(results: dict) -> None:
     if central is None and "Central" in scenarios:
         central = scenarios["Central"]
 
-    results_section_number = 5 if inputs.project_type == "replacement" else 4
+    technical_quote_mode = bool(getattr(inputs, "technical_quote_mode", False))
+    if technical_quote_mode:
+        results_section_number = 4 if inputs.project_type == "replacement" else 3
+    else:
+        results_section_number = 5 if inputs.project_type == "replacement" else 4
     st.header(f"{results_section_number}. Résultats")
 
     # ========================================================
@@ -1664,29 +1930,48 @@ def render_results(results: dict) -> None:
     # ========================================================
 
     st.subheader("Récapitulatif rapide")
-    st.write(
-        "Voici les principaux ordres de grandeur estimés pour votre bâtiment et pour "
-        "l'installation d'une pompe à chaleur géothermique."
-    )
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric(
-        "Puissance estimée de la pompe à chaleur",
-        f"{chauffage['p_pointe_kw']:.1f} kW",
-    )
-    c2.metric(
-        "Besoin annuel de chauffage",
-        f"{chauffage['energie_annuelle_kwh']:.0f} kWh/an",
-    )
-    c3.metric(
-        "Besoin annuel de climatisation",
-        f"{froid['q_froid_utile_kwh_an']:.0f} kWh/an",
-    )
+    if technical_quote_mode:
+        st.write(
+            "Voici les principales données techniques renseignées et les résultats "
+            "calculés à partir du devis."
+        )
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric(
+            "Puissance renseignée de la pompe à chaleur",
+            f"{chauffage['p_pointe_kw']:.1f} kW",
+        )
+        c2.metric(
+            "Besoin annuel de chauffage",
+            f"{chauffage['energie_annuelle_kwh']:.0f} kWh/an",
+        )
+        c3.metric(
+            "Besoin annuel de climatisation",
+            f"{froid['q_froid_utile_kwh_an']:.0f} kWh/an",
+        )
+        c4.metric("COP renseigné", f"{pac['spf']:.2f}")
+    else:
+        st.write(
+            "Voici les principaux ordres de grandeur estimés pour votre bâtiment et pour "
+            "l'installation d'une pompe à chaleur géothermique."
+        )
+        c1, c2, c3 = st.columns(3)
+        c1.metric(
+            "Puissance estimée de la pompe à chaleur",
+            f"{chauffage['p_pointe_kw']:.1f} kW",
+        )
+        c2.metric(
+            "Besoin annuel de chauffage",
+            f"{chauffage['energie_annuelle_kwh']:.0f} kWh/an",
+        )
+        c3.metric(
+            "Besoin annuel de climatisation",
+            f"{froid['q_froid_utile_kwh_an']:.0f} kWh/an",
+        )
 
     if inputs.project_type != "replacement":
         c4, c5 = st.columns(2)
         c4.metric(
-            "CAPEX estimé",
+            "CAPEX du devis" if technical_quote_mode else "CAPEX estimé",
             format_chf(pac["capex_brut"], decimals=0),
             help=(
                 "Le CAPEX représente l'investissement initial estimé, comprenant "
@@ -1724,7 +2009,7 @@ def render_results(results: dict) -> None:
 
     c4, c5, c6 = st.columns(3)
     c4.metric(
-        "CAPEX brut estimé",
+        "CAPEX brut du devis" if technical_quote_mode else "CAPEX brut estimé",
         format_chf(pac["capex_brut"], decimals=0),
         help=(
             "Le CAPEX représente l'investissement initial total, comprenant "
@@ -1844,8 +2129,21 @@ def init_session_state() -> None:
     if "results" not in st.session_state:
         st.session_state["results"] = None
 
+    if "results_mode" not in st.session_state:
+        st.session_state["results_mode"] = None
+
     if "interactive_adjustments" not in st.session_state:
         st.session_state["interactive_adjustments"] = default_interactive_adjustments()
+
+
+def render_application_error(error: Exception) -> None:
+    st.error(f"Erreur : {error}")
+    st.info(
+        "Vérifie en priorité : le code postal, le canton, les fichiers CSV de scénarios, "
+        "les données climatiques, le fichier de calibration du froid et l'installation de Plotly."
+    )
+    with st.expander("Détail technique de l'erreur"):
+        st.exception(error)
 
 
 def main() -> None:
@@ -1853,27 +2151,65 @@ def main() -> None:
 
     init_session_state()
 
-    try:
-        inputs = build_inputs_from_form()
+    tab_without_quote, tab_with_quote = st.tabs(
+        ["Projet sans devis", "Projet avec devis"]
+    )
 
-        if st.button("Lancer le calcul", type="primary"):
-            if not st.session_state.get("postcode_valid", False):
-                st.error("Le calcul ne peut pas être lancé tant que le code postal n'est pas valide.")
-            else:
-                st.session_state["results"] = evaluer_projet(inputs)
-                reset_interactive_adjustments()
+    with tab_without_quote:
+        try:
+            inputs = build_inputs_from_form()
 
-        if st.session_state["results"] is not None:
-            render_results(st.session_state["results"])
+            if st.button(
+                "Lancer le calcul",
+                type="primary",
+                key="btn_calculate_without_quote",
+            ):
+                if not st.session_state.get("postcode_valid", False):
+                    st.error(
+                        "Le calcul ne peut pas être lancé tant que le code postal "
+                        "n'est pas valide."
+                    )
+                else:
+                    st.session_state["results"] = evaluer_projet(inputs)
+                    st.session_state["results_mode"] = "without_quote"
+                    reset_interactive_adjustments()
 
-    except Exception as e:
-        st.error(f"Erreur : {e}")
-        st.info(
-            "Vérifie en priorité : le code postal, le canton, les fichiers CSV de scénarios, "
-            "les données climatiques, le fichier de calibration du froid et l'installation de Plotly."
-        )
-        with st.expander("Détail technique de l'erreur"):
-            st.exception(e)
+            if (
+                st.session_state.get("results") is not None
+                and st.session_state.get("results_mode") == "without_quote"
+            ):
+                render_results(st.session_state["results"])
+
+        except Exception as e:
+            render_application_error(e)
+
+    with tab_with_quote:
+        try:
+            quote_inputs = build_quote_inputs_from_form()
+
+            if st.button(
+                "Lancer le calcul avec les données du devis",
+                type="primary",
+                key="btn_calculate_with_quote",
+            ):
+                if not st.session_state.get("postcode_valid_quote", False):
+                    st.error(
+                        "Le calcul ne peut pas être lancé tant que le code postal "
+                        "n'est pas valide."
+                    )
+                else:
+                    st.session_state["results"] = evaluer_projet(quote_inputs)
+                    st.session_state["results_mode"] = "with_quote"
+                    reset_interactive_adjustments()
+
+            if (
+                st.session_state.get("results") is not None
+                and st.session_state.get("results_mode") == "with_quote"
+            ):
+                render_results(st.session_state["results"])
+
+        except Exception as e:
+            render_application_error(e)
 
 
 if __name__ == "__main__":
