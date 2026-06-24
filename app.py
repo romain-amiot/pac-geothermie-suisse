@@ -1,1872 +1,1859 @@
 from __future__ import annotations
 
-import math
 import os
 from pathlib import Path
-from typing import Any
 
+import matplotlib.pyplot as plt
 import pandas as pd
+import streamlit as st
+
 
 # ============================================================
-# CHEMINS ROBUSTES POUR STREAMLIT CLOUD
+# COMPATIBILITÉ STREAMLIT CLOUD / LINUX
 # ============================================================
 #
-# En local Windows, les chemins ne distinguent pas strictement Data/ et data/.
-# Sur Streamlit Cloud, l'application tourne sous Linux : la casse compte.
-# On définit donc la racine du projet dès le début du module et, si possible,
-# on crée des alias data -> Data et tools -> Tools. Cela sécurise aussi les
-# fonctions importées depuis Fonctions/ qui peuvent encore utiliser des chemins
-# historiques en minuscules.
-
-BASE_DIR = Path(__file__).resolve().parents[1]
-
-
-def _ensure_streamlit_cloud_case_aliases() -> None:
-    """Crée des alias de casse pour éviter les erreurs Data/data sous Linux.
-
-    Cette opération est sans effet sur Windows et reste non bloquante : si le
-    système ne permet pas les liens symboliques, le code continue simplement
-    avec les chemins explicites BASE_DIR / "Data" utilisés ci-dessous.
-    """
-    aliases = [
-        (BASE_DIR / "Data", BASE_DIR / "data"),
-        (BASE_DIR / "Tools", BASE_DIR / "tools"),
-    ]
-
-    for source, alias in aliases:
-        try:
-            if source.exists() and not alias.exists():
-                os.symlink(source, alias, target_is_directory=True)
-        except Exception:
-            # Non critique : les constantes de ce fichier utilisent déjà la casse correcte.
-            pass
+# Sur Windows, les chemins ne sont pas sensibles à la casse :
+# "Data/..." et "data/..." pointent vers le même dossier.
+# Sur Streamlit Cloud, l'application tourne sous Linux, où la casse compte.
+#
+# Certains modules historiques du projet peuvent chercher les fichiers dans
+# "data/...", alors que le dépôt GitHub contient le dossier "Data/".
+# On crée donc au démarrage un alias "data" -> "Data" avant d'importer les
+# modules internes qui chargent les CSV.
+#
+# Correction plus propre à long terme : harmoniser tous les chemins du projet
+# pour utiliser exactement le même nom de dossier, idéalement "Data" partout.
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_ROOT / "Data"
+LOWER_DATA_DIR = PROJECT_ROOT / "data"
 
 
-def project_path(*parts: str) -> Path:
-    """Retourne un chemin absolu depuis la racine du projet."""
-    return BASE_DIR.joinpath(*parts)
+def ensure_data_directory_alias() -> None:
+    if not DATA_DIR.exists() or LOWER_DATA_DIR.exists():
+        return
+
+    try:
+        # Fonctionne sur Streamlit Cloud / Linux.
+        os.symlink(DATA_DIR, LOWER_DATA_DIR, target_is_directory=True)
+    except Exception:
+        # Sur Windows, la création de symlink peut demander des droits admin.
+        # Ce n'est pas bloquant localement, car Windows ne distingue pas Data/data.
+        pass
 
 
-def first_existing_path(*paths: Path) -> Path:
-    """Retourne le premier chemin existant, sinon le premier chemin fourni.
-
-    Utile pour garder des fallbacks entre fichiers conservés dans le dépôt et
-    fichiers locaux de calibration exclus de GitHub.
-    """
-    for path in paths:
-        if path.exists():
-            return path
-    if not paths:
-        raise ValueError("Aucun chemin fourni.")
-    return paths[0]
-
-
-_ensure_streamlit_cloud_case_aliases()
+ensure_data_directory_alias()
 
 from models import ProjectInputs
-from Fonctions.puissance_pointe import calcul_pointe_et_energie_annuelle
-from Fonctions.rentabilite import (
-    gshp_capex_net_after_subsidy,
-    couts_annuels_gshp_zuberi,
-    load_price_path_electricity_ttc_by_canton,
-    load_price_path_fuel,
-    payback_discounted_from_cashflows,
-    project_requires_reference_system,
-    annual_om_cost_chf,
+from services.calcul_projet import (
+    evaluer_projet,
+    estimate_sdep_vh_from_perimeter,
+    estimate_sdep_vh_geometry,
+    DEFAULT_GEOMETRY_BY_BUILDING_TYPE,
+    K_SDEP_BY_BUILDING_TYPE,
 )
-from Fonctions.climat import (
-    cooling_hours_for_postcode,
-    cooling_degree_hours_for_postcode,
-    nearest_station_for_postcode,
-)
+from services.charts import build_cumulative_emissions_bar_chart
+from Fonctions.puissance_pointe import UBAT_CHOICES
 from Fonctions.localisation import postcode_info
 
-
-SCEN_ELEC_CSV = str(project_path("Data", "processed", "scenarios_electricity_ttc_by_canton.csv"))
-SCEN_GAS_CSV = str(project_path("Data", "processed", "scenarios_gas.csv"))
-SCEN_OIL_CSV = str(project_path("Data", "processed", "scenarios_mazout.csv"))
-
-# Les deux fichiers suivants sont utilisés s'ils sont disponibles.
-# Sur la version déployée, ils peuvent être absents si les dossiers de calibration
-# ont été exclus du dépôt : le code retombe alors sur les valeurs fallback internes.
-COOLING_QREF_CALIBRATED_CSV = first_existing_path(
-    project_path("Tools", "ajuster_coef_froid", "cooling_qref_calibrated_weighted.csv"),
-    project_path("Data", "cooling_qref_calibrated_weighted.csv"),
-)
-CLIMATE_STATION_REFERENCE_CSV = first_existing_path(
-    project_path("Tools", "ajuster_coef_froid", "climate_station_reference.csv"),
-    project_path("Data", "climate_station_reference.csv"),
-    project_path("Data", "climate_station_reference_detail.csv"),
-    project_path("Data", "climate_station_reference.csv"),
+st.set_page_config(
+    page_title="Rentabilité PAC géothermique",
+    layout="wide",
 )
 
-CO2_FACTORS_G_PER_KWH: dict[str, float] = {
-    "Électricité (réseau)": 90,
-    "Gaz naturel": 230,
-    "Mazout (fioul)": 324,
-}
-
-BUILDING_TYPE_PRICE_MAP = {
-    "maison_individuelle": "maison_individuelle",
-    "residentiel_collectif": "appartement",
-    "grand_batiment_compact": "appartement",
-    "mixte": "appartement",
-    "activites": "maison_individuelle",
-    "equipement_collectif": "maison_individuelle",
-    "bureaux": "appartement",
-    "ecole": "maison_individuelle",
-    "commerce": "maison_individuelle",
-}
-
-CENTRAL_SCENARIO = {"label": "Central", "electricity": "neutral", "fuel": "neutral"}
-
-PRICE_SENSITIVITY_SCENARIOS = {
-    "Électricité basse": {
-        "electricity": "optimistic",
-        "fuel": "neutral",
-        "description": "Test de sensibilité : prix de l'électricité plus bas que le cas central.",
-    },
-    "Électricité haute": {
-        "electricity": "pessimistic",
-        "fuel": "neutral",
-        "description": "Test de sensibilité : prix de l'électricité plus haut que le cas central.",
-    },
-    "Énergie actuelle basse": {
-        "electricity": "neutral",
-        "fuel": "optimistic",
-        "description": "Test de sensibilité : prix de l'énergie actuelle plus bas que le cas central.",
-    },
-    "Énergie actuelle haute": {
-        "electricity": "neutral",
-        "fuel": "pessimistic",
-        "description": "Test de sensibilité : prix de l'énergie actuelle plus haut que le cas central.",
-    },
-    "Différentiel favorable PAC": {
-        "electricity": "optimistic",
-        "fuel": "pessimistic",
-        "description": "Électricité plus basse et énergie actuelle plus haute.",
-    },
-    "Différentiel défavorable PAC": {
-        "electricity": "pessimistic",
-        "fuel": "optimistic",
-        "description": "Électricité plus haute et énergie actuelle plus basse.",
-    },
-}
-
 
 # ============================================================
-# FROID
+# CONSTANTES INTERFACE
 # ============================================================
 
-COOLING_QREF_FALLBACK_BY_TYPOLOGY_AND_CLIMATE = {
-    "residentiel": {"froid": 2.0, "tempere": 4.0, "chaud": 7.0, "tres_chaud": 12.0, "global": 5.0, "reference": 5.0},
-    "bureaux": {"froid": 14.0, "tempere": 25.0, "chaud": 40.0, "tres_chaud": 60.0, "global": 38.0, "reference": 38.0},
-    "ecole": {"froid": 8.0, "tempere": 15.0, "chaud": 25.0, "tres_chaud": 40.0, "global": 20.0, "reference": 20.0},
-    "commerce": {"froid": 25.0, "tempere": 45.0, "chaud": 65.0, "tres_chaud": 90.0, "global": 60.0, "reference": 60.0},
-    "equipement_collectif": {"froid": 20.0, "tempere": 35.0, "chaud": 50.0, "tres_chaud": 70.0, "global": 45.0, "reference": 45.0},
-    "activites": {"froid": 6.0, "tempere": 12.0, "chaud": 18.0, "tres_chaud": 30.0, "global": 16.0, "reference": 16.0},
-    "mixte": {"froid": 10.0, "tempere": 20.0, "chaud": 35.0, "tres_chaud": 55.0, "global": 30.0, "reference": 30.0},
+DEFAULT_CEILING_HEIGHT_M = 2.5
+DEFAULT_VENTILATION_R = 0.20
+EER_CLIM_ACTUEL_DEFAULT = 3.0
+
+INTERACTIVE_ADJUSTMENT_STEP = 10
+INTERACTIVE_ADJUSTMENT_MIN = -30
+INTERACTIVE_ADJUSTMENT_MAX = 30
+DISCOUNT_RATE_DISPLAY = 0.03
+ECONOMIC_HORIZON_DISPLAY_YEARS = 25
+
+CANTONS_SWISS = [
+    "Argovie",
+    "Appenzell Rhodes-Extérieures",
+    "Appenzell Rhodes-Intérieures",
+    "Bâle-Campagne",
+    "Bâle-Ville",
+    "Berne",
+    "Fribourg",
+    "Genève",
+    "Glaris",
+    "Grisons",
+    "Jura",
+    "Lucerne",
+    "Neuchâtel",
+    "Nidwald",
+    "Obwald",
+    "Schaffhouse",
+    "Schwyz",
+    "Soleure",
+    "Saint-Gall",
+    "Thurgovie",
+    "Tessin",
+    "Uri",
+    "Valais",
+    "Vaud",
+    "Zoug",
+    "Zurich",
+]
+
+ENERGY_CHOICES = {
+    "Gaz naturel": "Gaz naturel",
+    "Mazout (fioul)": "Mazout (fioul)",
+    "Électricité (réseau)": "Électricité (réseau)",
 }
 
-COOLING_SPF_BY_MODE = {"free_cooling": 12.0, "hybrid": 8.0, "active_cooling": 5.0}
-F_VITRAGE = {"faible": 0.90, "moyen": 1.00, "fort": 1.12}
-F_SOLAIRE = {"bonne": 0.82, "moyenne": 1.00, "faible": 1.18}
-F_USAGE = {"faible": 0.90, "normal": 1.00, "eleve": 1.15}
-F_NIGHT_BASE = {True: 0.90, False: 1.00}
-CDH_REF = 1600.0
-
-
-# ============================================================
-# GÉOMÉTRIE
-# ============================================================
-
-def estimate_sdep_vh_from_typology(
-    *,
-    shab_m2: float,
-    building_type_key: str,
-    hauteur_m: float,
-) -> tuple[float, float, dict[str, Any]]:
-    """
-    Estime Sdép et Vh à partir de la typologie calibrée.
-
-    La surface de déperdition est estimée par :
-        Sdép = K_typologique * Shab
-
-    Les coefficients K proviennent de l'étude typologique réalisée
-    sur les bâtiments genevois. Ils intègrent donc déjà, en moyenne,
-    les effets de compacité, de forme générale, d'allongement et de
-    morphologie du bâtiment.
-
-    Le volume chauffé reste estimé par :
-        Vh = Shab * hauteur_m
-    """
-    shab = _safe_float(shab_m2, None)
-    hauteur = _safe_float(hauteur_m, None)
-
-    if shab is None or shab <= 0:
-        raise ValueError("shab_m2 doit être > 0.")
-    if hauteur is None or hauteur <= 0:
-        raise ValueError("hauteur_m doit être > 0.")
-
-    key = _norm(building_type_key)
-
-    if key not in K_SDEP_BY_BUILDING_TYPE:
-        raise ValueError(
-            "Typologie inconnue pour l'estimation typologique calibrée : "
-            f"{building_type_key!r}. Typologies disponibles : "
-            f"{sorted(K_SDEP_BY_BUILDING_TYPE.keys())}"
-        )
-
-    k_typologique = float(K_SDEP_BY_BUILDING_TYPE[key])
-
-    sdep_est = k_typologique * float(shab)
-    vh_est = float(shab) * float(hauteur)
-
-    meta = {
-        "mode": "typologie_calibree_geneve",
-        "building_type_key": key,
-        "k_typologique": k_typologique,
-        "shab_m2": float(shab),
-        "hauteur_m": float(hauteur),
-        "sdep_m2": float(sdep_est),
-        "vh_m3": float(vh_est),
-    }
-
-    return float(sdep_est), float(vh_est), meta
-
-
-# Coefficients typologiques calibrés à partir de l'étude des bâtiments genevois.
-# Ils intègrent en moyenne les effets de compacité, de forme générale,
-# d'allongement et de morphologie du bâtiment.
-K_SDEP_BY_BUILDING_TYPE = {
-    "maison_individuelle": 2.10,
-    "residentiel_collectif": 1.92,
-    "grand_batiment_compact": 1.71,
-    "mixte": 1.69,
-    "activites": 1.99,
-    "equipement_collectif": 2.15,
+RENDEMENTS_STANDARDS: dict[str, float] = {
+    "Électricité (réseau)": 1.00,
+    "Gaz naturel": 0.90,
+    "Mazout (fioul)": 0.90,
 }
 
-# Ancienne méthode géométrique détaillée.
-# Conservée pour compatibilité, mais elle ne doit plus être utilisée dans
-# l'interface finale si l'on choisit l'approche typologique calibrée.
-FORM_RATIO_BY_SHAPE = {"carre": 1.0, "rectangulaire": 1.5, "allonge": 2.5, "irregulier": 1.8}
-MITOYENNETE_FACTOR = {"isole": 1.00, "1_cote": 0.75, "2_cotes": 0.50, "3_cotes": 0.25}
-
-# Valeurs par défaut encore utiles pour l'interface, notamment la hauteur.
-# Valeurs de hauteur sous plafond par défaut retenues pour le calcul typologique.
-# Elles servent à préremplir l'interface et comme hauteurs de référence pour
-# corriger la partie verticale de Sdép.
+# Libellés grand public pour conserver les coefficients Ubat internes
+# sans les afficher directement à l'utilisateur.
 #
-# Justification synthétique :
-# - résidentiel : 2.50 m ;
-# - mixte : 2.70 m ;
-# - activités / tertiaire : 2.75 m ;
-# - équipement collectif / bâtiment public : 3.00 m.
-DEFAULT_GEOMETRY_BY_BUILDING_TYPE = {
-    "maison_individuelle": {"forme_generale": "rectangulaire", "mitoyennete": "isole", "hauteur_m": 2.50, "toiture_exposee": True, "plancher_expose": True},
-    "residentiel_collectif": {"forme_generale": "rectangulaire", "mitoyennete": "isole", "hauteur_m": 2.50, "toiture_exposee": True, "plancher_expose": True},
-    "grand_batiment_compact": {"forme_generale": "carre", "mitoyennete": "isole", "hauteur_m": 2.50, "toiture_exposee": True, "plancher_expose": True},
-    "mixte": {"forme_generale": "rectangulaire", "mitoyennete": "isole", "hauteur_m": 2.70, "toiture_exposee": True, "plancher_expose": True},
-    "activites": {"forme_generale": "rectangulaire", "mitoyennete": "isole", "hauteur_m": 2.75, "toiture_exposee": True, "plancher_expose": True},
-    "equipement_collectif": {"forme_generale": "rectangulaire", "mitoyennete": "isole", "hauteur_m": 3.00, "toiture_exposee": True, "plancher_expose": True},
+# On n'utilise pas directement les clés de UBAT_CHOICES dans l'interface,
+# car elles peuvent être des chiffres ou des libellés techniques.
+# L'utilisateur voit uniquement ces catégories simplifiées, et le modèle
+# reçoit seulement le coefficient Ubat correspondant.
+DATE_CONSTRUCTION_UBAT = {
+    "Construction après 2012 avec isolation exceptionnelle": 0.30,
+    "Construction après 2012 sans ponts thermiques": 0.40,
+    "Construction 2001-2012": 0.75,
+    "Construction 1990-2000": 0.95,
+    "Construction 1983-1989": 1.15,
+    "Construction 1974-1982": 1.40,
+    "Construction avant 1974": 1.80,
 }
 
-_QREF_CACHE: pd.DataFrame | None = None
-_CLIMATE_REF_CACHE: pd.DataFrame | None = None
+DATE_CONSTRUCTION_CHOICES = list(DATE_CONSTRUCTION_UBAT.keys())
+
+TYPOLOGIES_MENU = [
+    ("maison_individuelle", "Maison individuelle"),
+    ("residentiel_collectif", "Immeuble résidentiel collectif"),
+    ("grand_batiment_compact", "Grand bâtiment compact"),
+    ("mixte", "Bâtiment mixte"),
+    ("activites", "Bâtiment d’activités / tertiaire"),
+    ("equipement_collectif", "Équipement collectif / bâtiment public"),
+]
 
 
-# ============================================================
-# INCERTITUDE
-# ============================================================
-
-UNCERTAINTY_N_SIMS = 5000
-UNCERTAINTY_PROJECT_LIFETIME_YEARS = 25
-UNCERTAINTY_PAYBACK_MAX_YEARS = 50
-UNCERTAINTY_DISCOUNT_RATE = 0.03
-
-UNCERTAINTY_DEFAULTS = {
-    "heating_need_sigma": 0.12,
-    "cooling_need_sigma": 0.30,
-    "heating_need_min": 0.80,
-    "heating_need_max": 1.30,
-    "cooling_need_min": 0.50,
-    "cooling_need_max": 2.00,
-    "capex_min": 0.88,
-    "capex_mode": 1.00,
-    "capex_max": 1.12,
-    "spf_heat_min": 0.90,
-    "spf_heat_mode": 1.00,
-    "spf_heat_max": 1.10,
-    "spf_cool_min": 0.90,
-    "spf_cool_mode": 1.00,
-    "spf_cool_max": 1.10,
-    "price_elec_sigma": 0.107,
-    "price_fuel_sigma": 0.040,
-    "om_min": 0.80,
-    "om_mode": 1.00,
-    "om_max": 1.20,
-    "capex_heat_need_elasticity": 0.00,
-    "om_heat_need_elasticity": 0.10,
+MITOYENNETE_LABELS = {
+    "isole": "Isolé",
+    "1_cote": "1 côté mitoyen",
+    "2_cotes": "2 côtés mitoyens",
+    "3_cotes": "3 côtés mitoyens",
 }
 
-COOLING_SIGMA_BY_TYPOLOGY = {
-    "bureaux": 0.22,
-    "ecole": 0.30,
-    "residentiel": 0.40,
-    "commerce": 0.28,
-    "activites": 0.35,
-    "equipement_collectif": 0.35,
-    "mixte": 0.35,
+MITOYENNETE_SDEP_FACTOR = {
+    "isole": 1.00,
+    "1_cote": 0.75,
+    "2_cotes": 0.50,
+    "3_cotes": 0.25,
 }
 
-
-# Risque spécifique aux énergies fossiles pour le Monte Carlo.
-#
-# Les paramètres ci-dessous sont calibrés à partir des séries historiques
-# utilisées dans le mémoire :
-# - gaz naturel : Prix_gaz_Energie360.csv ;
-# - mazout : Prix_mazout_Midland.csv.
-#
-# Méthode de calibration :
-# 1) agrégation des prix en moyennes annuelles ;
-# 2) calcul des rendements logarithmiques annuels r_t = ln(P_t/P_{t-1}) ;
-# 3) identification d'une année de choc si r_t > moyenne(r) + écart-type(r) ;
-# 4) probabilité de choc = fréquence historique des années de choc ;
-# 5) amplitude de choc = hausses observées pendant les années de choc.
-#
-# annual_drift est volontairement fixé à 0.0 afin de ne pas doubler la tendance
-# déjà contenue dans les trajectoires centrales de prix p_ref_life / p_ref_payback.
-# Le multiplicateur Monte Carlo représente donc l'incertitude autour du scénario
-# central, et non une deuxième trajectoire prospective.
-FOSSIL_RISK_PREMIUM = {
-    "Gaz naturel": {
-        # Le drift est fixé à zéro afin de ne pas doubler la tendance déjà
-        # contenue dans la trajectoire centrale de prix.
-        "annual_drift": 0.0,
-
-        # Volatilité résiduelle annualisée, estimée sur les années hors choc,
-        # puis utilisée dans un processus mean-reverting. La valeur n'est donc
-        # pas la volatilité historique brute appliquée en marche aléatoire.
-        # Incertitude persistante sur le niveau futur du gaz par rapport au
-        # scénario central. Elle élargit la distribution sans imposer de biais
-        # haussier : la médiane du facteur systémique vaut 1.
-        "systematic_sigma_log": 0.14,
-
-        # Volatilité résiduelle annualisée, estimée sur les années hors choc,
-        # puis utilisée dans un processus mean-reverting. Elle est volontairement
-        # plus faible que la volatilité historique brute pour éviter de compter
-        # deux fois les chocs.
-        "annual_sigma_residual": 0.10,
-        "mean_reversion_phi": 0.70,
-
-        # Fréquence historique : 2 années de choc sur 25 rendements annuels.
-        "shock_probability": 0.08,
-
-        # Amplitudes inspirées des chocs historiques observés. Le choc 2022 du
-        # gaz est très extrême ; on le garde dans la borne haute mais pas comme
-        # valeur centrale.
-        "shock_min": 0.15,
-        "shock_mode": 0.35,
-        "shock_max": 0.85,
-
-        # Choc temporaire avec retour progressif vers la trajectoire centrale.
-        "shock_duration_min": 1,
-        "shock_duration_max": 3,
-        "shock_decay": 0.50,
-
-        "min_multiplier": 0.65,
-        "max_multiplier": 2.25,
-        "calibration_source": "Prix_gaz_Energie360.csv",
-        "calibration_method": (
-            "rendements logarithmiques annuels ; choc si r_t > moyenne + 1 écart-type ; "
-            "volatilité résiduelle hors choc utilisée dans un processus mean-reverting"
-        ),
-        "shock_years": [2008, 2022],
-        "historical_shock_probability": 0.08,
-        "historical_full_sigma_log": 0.188,
-        "historical_nonshock_sigma_log": 0.123,
-    },
-    "Mazout (fioul)": {
-        "annual_drift": 0.0,
-
-        # Paramètres remis sur les valeurs historiques brutes de calibration.
-        #
-        # Calibration sur Prix_mazout_Midland.csv :
-        # - 30 rendements logarithmiques annuels exploitables ;
-        # - années de choc détectées avec r_t > moyenne + écart-type :
-        #   2000, 2005, 2008 et 2022 ;
-        # - fréquence historique : 4 / 30 = 13.3 %/an ;
-        # - amplitudes excédentaires observées après retrait de la tendance
-        #   moyenne : environ +32 %, +33 %, +57 % et +58 %.
-        #
-        # Cette version ne recentre pas les chocs et ne réduit pas
-        # arbitrairement leur amplitude. Elle sert à tester l'effet complet des
-        # chocs historiques, maintenant que le bug d'alignement des séries
-        # mazout/électricité est corrigé.
-        "systematic_sigma_log": 0.22,
-        "annual_sigma_residual": 0.176,
-        "mean_reversion_phi": 0.70,
-
-        "shock_probability": 0.133,
-
-        # Amplitude historique excédentaire des années de choc.
-        "shock_min": 0.32,
-        "shock_mode": 0.45,
-        "shock_max": 0.58,
-
-        # Durée temporaire du choc, comme dans le modèle fossile initial.
-        "shock_duration_min": 1,
-        "shock_duration_max": 3,
-        "shock_decay": 0.50,
-
-        # Pas de recentrage : on veut observer l'effet brut des paramètres
-        # historiques après correction de l'alignement des prix.
-        "center_shocks_log": False,
-
-        "min_multiplier": 0.75,
-        "max_multiplier": 2.80,
-        "calibration_source": "Prix_mazout_Midland.csv",
-        "calibration_method": (
-            "rendements logarithmiques annuels ; choc si r_t > moyenne + 1 écart-type ; "
-            "fréquence historique brute 4/30 = 13.3 %/an ; amplitudes historiques "
-            "excédentaires min/médiane/max environ 32 %, 45 % et 58 %"
-        ),
-        "shock_years": [2000, 2005, 2008, 2022],
-        "historical_shock_probability": 0.133,
-        "effective_shock_probability": 0.133,
-        "historical_full_sigma_log": 0.222,
-        "historical_nonshock_sigma_log": 0.176,
-        "historical_excess_shock_amplitudes": [0.320, 0.332, 0.574, 0.583],
-    },
-}
-FOSSIL_ENERGY_LABELS = set(FOSSIL_RISK_PREMIUM.keys())
-
-
-# ============================================================
-# OUTILS GÉNÉRAUX
-# ============================================================
-
-def g_per_kwh_to_kg_per_kwh(g_per_kwh: float) -> float:
-    return g_per_kwh / 1000.0
-
-
-def _norm(value: Any) -> str:
-    if value is None:
-        return ""
-    return (
-        str(value)
-        .strip()
-        .lower()
-        .replace("é", "e")
-        .replace("è", "e")
-        .replace("ê", "e")
-        .replace("à", "a")
-        .replace("ù", "u")
-        .replace("ç", "c")
-        .replace("-", "_")
-        .replace(" ", "_")
-    )
-
-
-def _safe_float(value: Any, default: float | None = None) -> float | None:
-    if value is None:
-        return default
-    try:
-        if isinstance(value, str):
-            value = value.strip().replace(",", ".")
-            if value == "":
-                return default
-        val = float(value)
-        if pd.isna(val):
-            return default
-        return val
-    except Exception:
-        return default
-
-
-def _clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, float(value)))
-
-
-def _get_price_building_type(building_type_key: str) -> str:
-    key = _norm(building_type_key)
-    return BUILDING_TYPE_PRICE_MAP.get(key, "appartement")
-
-
-def _normalize_factors_to_median_one(values: list[float]) -> list[float]:
-    import numpy as np
-    if not values:
-        return values
-    med = float(np.median(values))
-    if med <= 0:
-        return values
-    return [float(v) / med for v in values]
-
-
-def normalize_calibration_typology(building_type_key: str) -> str:
-    key = _norm(building_type_key)
-    mapping = {
-        "maison_individuelle": "residentiel",
-        "residentiel_collectif": "residentiel",
-        "grand_batiment_compact": "residentiel",
-        "residentiel": "residentiel",
-        "logement": "residentiel",
-        "logements": "residentiel",
-        "mixte": "mixte",
-        "activites": "activites",
-        "activite": "activites",
-        "equipement_collectif": "equipement_collectif",
-        "equipement": "equipement_collectif",
-        "bureaux": "bureaux",
-        "bureau": "bureaux",
-        "office": "bureaux",
-        "ecole": "ecole",
-        "enseignement": "ecole",
-        "commerce": "commerce",
-    }
-    return mapping.get(key, key if key else "mixte")
-
-
-def normalize_climate_class(climate_class: str) -> str:
-    key = _norm(climate_class)
-    mapping = {
-        "froid": "froid",
-        "cold": "froid",
-        "tempere": "tempere",
-        "temperate": "tempere",
-        "chaud": "chaud",
-        "hot": "chaud",
-        "tres_chaud": "tres_chaud",
-        "treschaud": "tres_chaud",
-        "very_hot": "tres_chaud",
-        "global": "global",
-        "reference": "reference",
-    }
-    return mapping.get(key, key if key else "tempere")
-
-
-def climate_class_from_cdh(cooling_degree_hours: float) -> str:
-    cdh = _safe_float(cooling_degree_hours, 0.0) or 0.0
-    if cdh < 250:
-        return "froid"
-    if cdh < 650:
-        return "tempere"
-    if cdh < 1100:
-        return "chaud"
-    return "tres_chaud"
-
-
-def station_name_from_station_info(station_info: Any) -> str:
-    if station_info is None:
-        return ""
-    if isinstance(station_info, dict):
-        for key in ["station_name", "name", "nom", "station", "ville"]:
-            if key in station_info and station_info[key]:
-                return str(station_info[key])
-    for attr in ["station_name", "name", "nom", "station", "ville"]:
-        if hasattr(station_info, attr):
-            val = getattr(station_info, attr)
-            if val:
-                return str(val)
-    return ""
-
-
-def _lognormal_factor(rng: Any, sigma: float) -> float:
-    return float(rng.lognormal(mean=0.0, sigma=sigma))
-
-
-def _bounded_lognormal_factor(rng: Any, sigma: float, low: float, high: float) -> float:
-    return _clamp(_lognormal_factor(rng, sigma), low, high)
-
-
-def _triangular_mean(left: float, mode: float, right: float) -> float:
-    return (float(left) + float(mode) + float(right)) / 3.0
-
-
-def _expected_log_shock_size(fossil_cfg: dict) -> float:
-    """
-    Approximation de E[log(1 + choc)] pour recentrer les chocs.
-
-    On utilise une approximation par grille plutôt que log(1 + moyenne), car
-    le choc résiduel du mazout peut être légèrement négatif.
-    """
-    import numpy as np
-
-    def approx_triangular_log_mean(left: float, mode: float, right: float) -> float:
-        # Approximation déterministe suffisamment précise pour le recentrage.
-        xs = np.linspace(float(left), float(right), 401)
-        left_f, mode_f, right_f = float(left), float(mode), float(right)
-
-        # Densité triangulaire.
-        density = np.zeros_like(xs)
-        if mode_f > left_f:
-            mask = (xs >= left_f) & (xs <= mode_f)
-            density[mask] = 2 * (xs[mask] - left_f) / ((right_f - left_f) * (mode_f - left_f))
-        if right_f > mode_f:
-            mask = (xs > mode_f) & (xs <= right_f)
-            density[mask] = 2 * (right_f - xs[mask]) / ((right_f - left_f) * (right_f - mode_f))
-
-        if density.sum() <= 0:
-            return math.log1p(max(left_f, -0.95))
-
-        vals = np.log1p(np.clip(xs, -0.95, None))
-        area_num = float(np.trapezoid(vals * density, xs)) if hasattr(np, "trapezoid") else float(sum((vals[:-1] * density[:-1] + vals[1:] * density[1:]) * (xs[1:] - xs[:-1]) / 2.0))
-        area_den = float(np.trapezoid(density, xs)) if hasattr(np, "trapezoid") else float(sum((density[:-1] + density[1:]) * (xs[1:] - xs[:-1]) / 2.0))
-        if area_den <= 0:
-            return math.log1p(max(left_f, -0.95))
-        return float(area_num / area_den)
-
-    p_extreme = float(fossil_cfg.get("extreme_shock_probability", 0.0))
-
-    moderate = approx_triangular_log_mean(
-        fossil_cfg["shock_min"],
-        fossil_cfg["shock_mode"],
-        fossil_cfg["shock_max"],
-    )
-
-    if p_extreme > 0:
-        extreme = approx_triangular_log_mean(
-            fossil_cfg["extreme_shock_min"],
-            fossil_cfg["extreme_shock_mode"],
-            fossil_cfg["extreme_shock_max"],
-        )
-        return (1.0 - p_extreme) * moderate + p_extreme * extreme
-
-    return moderate
-
-
-def build_fossil_price_risk_multiplier(
-    *,
-    rng: Any,
-    n_years: int,
-    energy_label: str | None,
-) -> list[float]:
-    """
-    Génère un multiplicateur annuel pour les prix fossiles.
-
-    Objectif du modèle : représenter un risque fossile visible, justifiable
-    historiquement, sans produire des trajectoires absurdes.
-
-    Le multiplicateur est appliqué à la trajectoire centrale :
-        prix_simulé(t) = prix_central(t) * multiplicateur(t)
-
-    La trajectoire centrale contient déjà une hypothèse de prix future. Le
-    Monte Carlo n'ajoute donc pas une nouvelle tendance permanente. Il ajoute :
-    1) une volatilité résiduelle mean-reverting autour du scénario central ;
-    2) des chocs haussiers temporaires calibrés sur les années de choc
-       observées dans les séries historiques, avec une fréquence historique
-       conservée mais une amplitude résiduelle recentrée.
-
-    Différence avec l'ancienne version : on n'utilise plus une marche aléatoire
-    cumulative avec la volatilité historique complète. Cette ancienne méthode
-    créait des prix fossiles durablement trop élevés et des paybacks souvent
-    irréalistes autour de 2 ans.
-    """
-    import numpy as np
-
-    if energy_label not in FOSSIL_RISK_PREMIUM:
-        return [1.0] * int(n_years)
-
-    fossil_cfg = FOSSIL_RISK_PREMIUM[energy_label]
-
-    n_years = int(n_years)
-    if n_years <= 0:
-        return []
-
-    annual_drift = float(fossil_cfg.get("annual_drift", 0.0))
-    sigma_systematic = float(fossil_cfg.get("systematic_sigma_log", 0.0))
-    sigma_residual = float(fossil_cfg.get("annual_sigma_residual", 0.10))
-    phi = float(fossil_cfg.get("mean_reversion_phi", 0.70))
-    phi = _clamp(phi, 0.0, 0.95)
-
-    # 1) Incertitude persistante de niveau.
-    # Elle est propre à toute la trajectoire simulée. Sa médiane vaut 1, ce qui
-    # évite d'ajouter une tendance haussière au scénario central, mais elle
-    # autorise des trajectoires durablement plus basses ou plus hautes. C'est ce
-    # qui évite une distribution trop concentrée autour de la moyenne.
-    systematic_log_level = rng.normal(loc=0.0, scale=sigma_systematic)
-
-    # 2) Processus mean-reverting en log-multiplicateur.
-    # La volatilité stationnaire est environ sigma_residual. Cela donne des
-    # écarts persistants, mais évite la dérive explosive d'une marche aléatoire.
-    innovation_sigma = sigma_residual * (1.0 - phi ** 2) ** 0.5
-    log_multiplier = np.zeros(n_years, dtype=float)
-
-    for t in range(n_years):
-        eps = rng.normal(loc=0.0, scale=innovation_sigma)
-        if t == 0:
-            residual = eps
-        else:
-            residual = phi * (log_multiplier[t - 1] - systematic_log_level - annual_drift * (t - 1)) + eps
-        log_multiplier[t] = systematic_log_level + annual_drift * t + residual
-
-    # Chocs haussiers temporaires. Le choc est fort la première année, puis
-    # décroît selon shock_decay. Il ne devient donc pas un nouveau niveau de prix
-    # permanent.
-    shock_probability = float(fossil_cfg["shock_probability"])
-    shock_decay = float(fossil_cfg.get("shock_decay", 0.50))
-    shock_decay = _clamp(shock_decay, 0.0, 1.0)
-
-    expected_log_shock_per_year = 0.0
-    if bool(fossil_cfg.get("center_shocks_log", False)):
-        expected_log_shock_per_year = (
-            shock_probability * _expected_log_shock_size(fossil_cfg)
-        )
-
-    for year_idx in range(n_years):
-        if rng.random() < shock_probability:
-            # Distribution mixte :
-            # - par défaut, choc modéré ;
-            # - si extreme_shock_probability est défini, une petite fraction
-            #   des chocs devient un choc extrême.
-            if (
-                "extreme_shock_probability" in fossil_cfg
-                and rng.random() < float(fossil_cfg["extreme_shock_probability"])
-            ):
-                shock_size = rng.triangular(
-                    left=float(fossil_cfg["extreme_shock_min"]),
-                    mode=float(fossil_cfg["extreme_shock_mode"]),
-                    right=float(fossil_cfg["extreme_shock_max"]),
-                )
-            else:
-                shock_size = rng.triangular(
-                    left=float(fossil_cfg["shock_min"]),
-                    mode=float(fossil_cfg["shock_mode"]),
-                    right=float(fossil_cfg["shock_max"]),
-                )
-
-            duration = int(
-                rng.integers(
-                    int(fossil_cfg["shock_duration_min"]),
-                    int(fossil_cfg["shock_duration_max"]) + 1,
-                )
-            )
-
-            for k in range(duration):
-                idx = year_idx + k
-                if idx >= n_years:
-                    break
-                effective_shock = shock_size * (shock_decay ** k)
-                log_multiplier[idx] += np.log1p(effective_shock)
-
-    if expected_log_shock_per_year != 0.0:
-        log_multiplier = log_multiplier - expected_log_shock_per_year
-
-    multiplier = np.exp(log_multiplier)
-    multiplier = np.clip(
-        multiplier,
-        float(fossil_cfg["min_multiplier"]),
-        float(fossil_cfg["max_multiplier"]),
-    )
-
-    return [float(x) for x in multiplier]
-
-def _triangular_factor(rng: Any, low: float, mode: float, high: float) -> float:
-    return float(rng.triangular(left=low, mode=mode, right=high))
-
-
-def _constant_series_like(index: Any, value: float) -> pd.Series:
-    return pd.Series(float(value), index=index)
-
-
-def _series_first_n_years(series: pd.Series, n_years: int) -> pd.Series:
-    if series is None or len(series) == 0:
-        raise ValueError("Série vide ou None.")
-
-    s = pd.Series(series).copy()
-    s = pd.to_numeric(s, errors="coerce")
-    s = s.replace([float("inf"), float("-inf")], pd.NA)
-    s = s.interpolate(method="linear", limit_direction="both").ffill().bfill()
-
-    if len(s) == 0 or s.isna().all():
-        raise ValueError("Série de prix non exploitable après nettoyage.")
-
-    s = s.astype(float)
-
-    if len(s) >= n_years:
-        return s.iloc[:n_years].copy()
-
-    last_value = float(s.iloc[-1])
-    missing = n_years - len(s)
-    if len(s.index) > 0 and isinstance(s.index[-1], (int, float)):
-        start = int(s.index[-1]) + 1
-        extension_index = range(start, start + missing)
-    else:
-        extension_index = range(len(s), len(s) + missing)
-    extension = pd.Series([last_value] * missing, index=extension_index)
-    return pd.concat([s, extension])
-
-
-
-def _clean_price_series(series: pd.Series, *, name: str = "price") -> pd.Series:
-    """
-    Nettoie une série de prix utilisée dans les calculs déterministes.
-
-    Cette fonction évite que des valeurs manquantes ou des années non alignées
-    entre électricité et combustible fossile fassent disparaître les indicateurs
-    déterministes ou les graphes de coûts cumulés.
-    """
-    if series is None or len(series) == 0:
-        raise ValueError(f"Série de prix vide : {name}.")
-
-    s = pd.Series(series).copy()
-    s.index = pd.to_numeric(pd.Index(s.index), errors="coerce")
-    s = pd.to_numeric(s, errors="coerce")
-    s = s[~pd.isna(s.index)]
-    s.index = s.index.astype(int)
-    s = s.sort_index()
-    s = s.replace([float("inf"), float("-inf")], pd.NA)
-    s = s.interpolate(method="linear", limit_direction="both").ffill().bfill()
-
-    if s.empty or s.isna().all():
-        raise ValueError(f"Série de prix non exploitable : {name}.")
-
-    return s.astype(float)
-
-
-def _align_price_series_to_index(
-    series: pd.Series,
-    target_index: Any,
-    *,
-    name: str = "price",
-) -> pd.Series:
-    """
-    Aligne une série de prix sur l'index d'une autre série.
-
-    Cas important corrigé ici :
-    - la série mazout peut commencer en 2025 ;
-    - la série électricité peut commencer en 2026 ;
-    - sans alignement, les coûts déterministes mélangent des années différentes
-      et peuvent produire des graphes incomplets ou incohérents.
-
-    Les années manquantes sont interpolées, puis prolongées par la dernière
-    valeur connue si nécessaire.
-    """
-    s = _clean_price_series(series, name=name)
-    target = pd.Index(pd.to_numeric(pd.Index(target_index), errors="coerce"))
-    target = target[~pd.isna(target)].astype(int)
-
-    if len(target) == 0:
-        raise ValueError(f"Index cible vide pour l'alignement de {name}.")
-
-    union_index = sorted(set(s.index.astype(int)) | set(target.astype(int)))
-    s = s.reindex(union_index).interpolate(method="linear", limit_direction="both").ffill().bfill()
-    s = s.reindex(target).interpolate(method="linear", limit_direction="both").ffill().bfill()
-
-    if s.isna().any():
-        raise ValueError(f"Impossible d'aligner complètement la série de prix : {name}.")
-
-    return s.astype(float)
-
-
-def discounted_payback_from_annual_savings(*, capex_net: float, annual_savings: pd.Series, discount_rate: float = 0.03) -> float | None:
-    cumulative = -float(capex_net)
-    for i, saving in enumerate(annual_savings, start=1):
-        saving_f = _safe_float(saving, 0.0) or 0.0
-        discounted_saving = float(saving_f) / ((1.0 + discount_rate) ** i)
-        previous = cumulative
-        cumulative += discounted_saving
-        if cumulative >= 0:
-            if discounted_saving <= 0:
-                return float(i)
-            fraction = abs(previous) / discounted_saving
-            return float((i - 1) + fraction)
-    return None
-
-
-def npv_from_annual_savings(*, capex_net: float, annual_savings: pd.Series, discount_rate: float = 0.03) -> float:
-    npv = -float(capex_net)
-    for i, saving in enumerate(annual_savings, start=1):
-        saving_f = _safe_float(saving, 0.0) or 0.0
-        npv += float(saving_f) / ((1.0 + discount_rate) ** i)
-    return float(npv)
-
-
-def _finite_percentile(values: list[float], p: float) -> float | None:
-    if not values:
-        return None
-    import numpy as np
-    finite_values = [float(v) for v in values if v is not None and math.isfinite(float(v))]
-    if not finite_values:
-        return None
-    return float(np.percentile(finite_values, p))
-
-
-def _share_below(values: list[float], threshold: float, n_total: int) -> float:
-    if n_total <= 0:
-        return 0.0
-    ok = [v for v in values if v is not None and math.isfinite(float(v)) and float(v) <= threshold]
-    return len(ok) / n_total
-
-
-def _median_is_representative(values: list[float], n_total: int) -> bool:
-    if n_total <= 0:
-        return False
-    finite_values = [v for v in values if v is not None and math.isfinite(float(v))]
-    return len(finite_values) >= 0.5 * n_total
-
-
-# ============================================================
-# LECTURE DES FICHIERS DE CALIBRATION FROID
-# ============================================================
-
-def load_cooling_qref_table() -> pd.DataFrame | None:
-    global _QREF_CACHE
-    if _QREF_CACHE is not None:
-        return _QREF_CACHE
-    candidate_paths = [
-        COOLING_QREF_CALIBRATED_CSV,
-        project_path("Data", "cooling_qref_calibrated_weighted.csv"),
-        project_path("Tools", "ajuster_coef_froid", "cooling_qref_calibrated_weighted.csv"),
-        BASE_DIR / "cooling_qref_calibrated_weighted.csv",
-        Path.cwd() / "cooling_qref_calibrated_weighted.csv",
-    ]
-    for path in candidate_paths:
-        if path.exists():
-            df = pd.read_csv(path, sep=";", encoding="utf-8-sig")
-            df["typologie"] = df["typologie"].astype(str).map(normalize_calibration_typology)
-            df["climate_class"] = df["climate_class"].astype(str).map(normalize_climate_class)
-            for col in ["qref_weighted_median_kwh_m2_an", "qref_weighted_mean_kwh_m2_an", "qref_unweighted_median_kwh_m2_an"]:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-            _QREF_CACHE = df
-            return _QREF_CACHE
-    _QREF_CACHE = None
-    return None
-
-
-def load_climate_station_reference() -> pd.DataFrame | None:
-    global _CLIMATE_REF_CACHE
-    if _CLIMATE_REF_CACHE is not None:
-        return _CLIMATE_REF_CACHE
-    candidate_paths = [
-        CLIMATE_STATION_REFERENCE_CSV,
-        project_path("Data", "climate_station_reference.csv"),
-        project_path("Data", "climate_station_reference_detail.csv"),
-        project_path("Tools", "ajuster_coef_froid", "climate_station_reference.csv"),
-        BASE_DIR / "climate_station_reference.csv",
-        Path.cwd() / "climate_station_reference.csv",
-    ]
-    for path in candidate_paths:
-        if path.exists():
-            df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
-            if "station_name" in df.columns:
-                df["station_name_norm"] = df["station_name"].astype(str).map(_norm)
-            else:
-                df["station_name_norm"] = ""
-            if "climate_class" in df.columns:
-                df["climate_class"] = df["climate_class"].astype(str).map(normalize_climate_class)
-            for col in ["cdh_26_ref", "f_climat_cdh26_vs_ref", "f_night_potential_vs_ref", "f_hot_nights_vs_ref"]:
-                if col in df.columns:
-                    df[col] = pd.to_numeric(df[col], errors="coerce")
-            _CLIMATE_REF_CACHE = df
-            return _CLIMATE_REF_CACHE
-    _CLIMATE_REF_CACHE = None
-    return None
-
-
-def get_station_climate_reference(station_name: str) -> dict[str, Any] | None:
-    df = load_climate_station_reference()
-    if df is None or df.empty:
-        return None
-    station_norm = _norm(station_name)
-    if not station_norm or "station_name_norm" not in df.columns:
-        return None
-    exact = df[df["station_name_norm"] == station_norm]
-    if not exact.empty:
-        return exact.iloc[0].to_dict()
-    contains = df[df["station_name_norm"].str.contains(station_norm, na=False)]
-    if not contains.empty:
-        return contains.iloc[0].to_dict()
-    return None
-
-
-def get_fallback_qref(typologie: str, climate_class: str) -> float:
-    typ = normalize_calibration_typology(typologie)
-    clim = normalize_climate_class(climate_class)
-    table = COOLING_QREF_FALLBACK_BY_TYPOLOGY_AND_CLIMATE
-    if typ in table and clim in table[typ]:
-        return float(table[typ][clim])
-    if typ in table and "global" in table[typ]:
-        return float(table[typ]["global"])
-    return float(table["mixte"]["global"])
-
-
-def get_calibrated_qref(typologie: str, climate_class: str) -> tuple[float, str]:
-    typ = normalize_calibration_typology(typologie)
-    clim = normalize_climate_class(climate_class)
-    fallback = get_fallback_qref(typ, clim)
-    df = load_cooling_qref_table()
-    if df is None or df.empty:
-        return fallback, "fallback_interne_csv_absent"
-    value_cols = ["qref_weighted_median_kwh_m2_an", "qref_weighted_mean_kwh_m2_an", "qref_unweighted_median_kwh_m2_an"]
-    for target_climate, source_label in [(clim, "csv_typologie_climat"), ("global", "csv_typologie_global"), ("reference", "csv_typologie_reference")]:
-        rows = df[(df["typologie"] == typ) & (df["climate_class"] == target_climate)]
-        if rows.empty:
-            continue
-        row = rows.iloc[0]
-        for col in value_cols:
-            if col in row.index:
-                val = _safe_float(row[col], None)
-                if val is not None and val > 0:
-                    return float(val), source_label
-    return fallback, "fallback_interne_absence_ligne"
-
-
-# ============================================================
-# GÉOMÉTRIE
-# ============================================================
-
-def estimate_sdep_vh_from_perimeter(shab_m2: float, niveaux: int, perimetre_m: float, hauteur_m: float, toiture_exposee: bool, plancher_expose: bool) -> tuple[float, float]:
-    a_foot = shab_m2 / niveaux
-    s_murs = perimetre_m * (niveaux * hauteur_m)
-    s_toit = a_foot if toiture_exposee else 0.0
-    s_plancher = a_foot if plancher_expose else 0.0
-    sdep_est = s_murs + s_toit + s_plancher
-    vh_est = shab_m2 * hauteur_m
-    return sdep_est, vh_est
-
-
-def estimate_sdep_vh_geometry(
+def estimate_sdep_vh_typology_with_exposure(
     *,
     shab_m2: float,
     niveaux: int,
     hauteur_m: float,
-    forme_generale: str,
+    building_type_key: str,
     mitoyennete: str,
     toiture_exposee: bool,
     plancher_expose: bool,
-    longueur_m: float | None = None,
-    largeur_m: float | None = None,
 ) -> tuple[float, float, dict]:
+    """
+    Estimation typologique corrigée.
+
+    La forme générale n'est pas demandée : elle reste intégrée dans le
+    coefficient typologique K du type de bâtiment.
+
+    Pour que le nombre d'étages et la hauteur sous plafond aient bien un effet,
+    on décompose la Sdép typologique en :
+    - une partie verticale, corrigée par le ratio entre la hauteur saisie et
+      une hauteur de référence propre à la typologie ;
+    - une partie horizontale, égale à l'empreinte au sol calculée directement
+      avec le nombre de niveaux renseigné par l'utilisateur.
+
+    La mitoyenneté est ensuite appliquée uniquement sur la partie verticale,
+    car elle concerne les façades et non la toiture ou le plancher.
+    """
     if shab_m2 <= 0:
-        raise ValueError("shab_m2 doit être > 0.")
+        raise ValueError("La surface chauffée doit être positive.")
     if niveaux <= 0:
-        raise ValueError("niveaux doit être > 0.")
+        raise ValueError("Le nombre de niveaux doit être positif.")
     if hauteur_m <= 0:
-        raise ValueError("hauteur_m doit être > 0.")
-    if mitoyennete not in MITOYENNETE_FACTOR:
-        raise ValueError(f"mitoyennete invalide: {mitoyennete}")
-    a_sol = shab_m2 / niveaux
-    if longueur_m is not None and largeur_m is not None:
-        if longueur_m <= 0 or largeur_m <= 0:
-            raise ValueError("longueur_m et largeur_m doivent être > 0.")
-        longueur = longueur_m
-        largeur = largeur_m
-        ratio_forme = longueur / largeur
-        plan_source = "dimensions_reelles"
-    else:
-        if forme_generale not in FORM_RATIO_BY_SHAPE:
-            raise ValueError(f"forme_generale invalide: {forme_generale}")
-        ratio_forme = FORM_RATIO_BY_SHAPE[forme_generale]
-        longueur = (a_sol * ratio_forme) ** 0.5
-        largeur = (a_sol / ratio_forme) ** 0.5
-        plan_source = "forme_generale"
-    perimetre = 2.0 * (longueur + largeur)
-    s_murs_brut = perimetre * (niveaux * hauteur_m)
-    f_mitoyennete = MITOYENNETE_FACTOR[mitoyennete]
-    s_murs = s_murs_brut * f_mitoyennete
-    s_toit = a_sol if toiture_exposee else 0.0
-    s_plancher = a_sol if plancher_expose else 0.0
-    sdep_est = s_murs + s_toit + s_plancher
-    vh_est = shab_m2 * hauteur_m
+        raise ValueError("La hauteur moyenne doit être positive.")
+
+    if building_type_key not in K_SDEP_BY_BUILDING_TYPE:
+        raise ValueError(f"Typologie inconnue : {building_type_key!r}")
+
+    if mitoyennete not in MITOYENNETE_SDEP_FACTOR:
+        raise ValueError(f"Mitoyenneté inconnue : {mitoyennete!r}")
+
+    k_typologique = float(K_SDEP_BY_BUILDING_TYPE[building_type_key])
+
+    # Hauteur de référence uniquement pour corriger la partie verticale.
+    # On revient ici à la méthode par ratio, car K_typologique correspond déjà
+    # à une enveloppe moyenne calibrée avec une hauteur implicite de référence.
+    hauteur_ref = float(
+        DEFAULT_GEOMETRY_BY_BUILDING_TYPE.get(building_type_key, {}).get(
+            "hauteur_m",
+            2.7,
+        )
+    )
+
+    # Sdép typologique issue de K.
+    sdep_typologique_ref = k_typologique * float(shab_m2)
+
+    # Empreinte au sol directement issue du nombre de niveaux renseigné par
+    # l'utilisateur. On n'utilise pas de nombre de niveaux de référence.
+    empreinte_sol = float(shab_m2) / int(niveaux)
+
+    # On considère que la Sdép typologique contient une part horizontale
+    # correspondant à la toiture et au plancher. Cette part est calculée avec
+    # l'empreinte réelle du bâtiment, donc avec le nombre de niveaux saisi.
+    s_horizontal_ref = 2.0 * empreinte_sol
+    s_vertical_ref = max(0.0, sdep_typologique_ref - s_horizontal_ref)
+
+    # La hauteur sous plafond corrige uniquement la partie verticale.
+    facteur_hauteur = float(hauteur_m) / hauteur_ref if hauteur_ref > 0 else 1.0
+    s_vertical_corrigee = s_vertical_ref * facteur_hauteur
+
+    # La mitoyenneté ne concerne que les façades, donc uniquement la partie
+    # verticale. Elle ne doit pas réduire la toiture ni le plancher.
+    facteur_mitoyennete = float(MITOYENNETE_SDEP_FACTOR[mitoyennete])
+    s_vertical_apres_mitoyennete = s_vertical_corrigee * facteur_mitoyennete
+
+    # La surface horizontale dépend du nombre d'étages et de l'exposition.
+    s_toiture = empreinte_sol if toiture_exposee else 0.0
+    s_plancher = empreinte_sol if plancher_expose else 0.0
+
+    sdep_corrigee = s_vertical_apres_mitoyennete + s_toiture + s_plancher
+    sdep_corrigee = max(1.0, float(sdep_corrigee))
+
+    vh_est = float(shab_m2) * float(hauteur_m)
+
     meta = {
-        "a_sol_m2": a_sol,
-        "ratio_forme": ratio_forme,
-        "longueur_m": longueur,
-        "largeur_m": largeur,
-        "perimetre_m": perimetre,
-        "s_murs_brut_m2": s_murs_brut,
-        "f_mitoyennete": f_mitoyennete,
-        "s_murs_m2": s_murs,
-        "s_toit_m2": s_toit,
-        "s_plancher_m2": s_plancher,
-        "plan_source": plan_source,
+        "k_typologique": k_typologique,
+        "sdep_typologique_ref_m2": float(sdep_typologique_ref),
+        "hauteur_ref_m": float(hauteur_ref),
+        "hauteur_utilisateur_m": float(hauteur_m),
+        "facteur_hauteur": float(facteur_hauteur),
+        "niveaux_utilisateur": int(niveaux),
+        "empreinte_sol_m2": float(empreinte_sol),
+        "s_horizontal_ref_m2": float(s_horizontal_ref),
+        "s_vertical_ref_m2": float(s_vertical_ref),
+        "s_vertical_corrigee_m2": float(s_vertical_corrigee),
+        "facteur_mitoyennete": facteur_mitoyennete,
+        "s_vertical_apres_mitoyennete_m2": float(s_vertical_apres_mitoyennete),
+        "s_toiture_m2": float(s_toiture),
+        "s_plancher_m2": float(s_plancher),
+        "sdep_corrigee_m2": float(sdep_corrigee),
+        "vh_m3": float(vh_est),
     }
-    return sdep_est, vh_est, meta
+
+    return float(sdep_corrigee), float(vh_est), meta
 
 
 # ============================================================
-# FROID
+# OUTILS AFFICHAGE
 # ============================================================
 
-def softened_climate_factor(*, climate_class: str, cooling_degree_hours: float, station_ref: dict[str, Any] | None) -> tuple[float, str]:
-    if station_ref is not None:
-        raw = _safe_float(station_ref.get("f_climat_cdh26_vs_ref"), None)
-        if raw is not None and raw > 0:
-            softened = 1.0 + 0.35 * (raw - 1.0)
-            return _clamp(softened, 0.75, 1.30), "station_reference_adoucie"
-    cdh = _safe_float(cooling_degree_hours, 0.0) or 0.0
-    raw = cdh / CDH_REF if CDH_REF > 0 else 1.0
-    softened = 1.0 + 0.25 * (raw - 1.0)
-    climate_class = normalize_climate_class(climate_class)
-    if climate_class == "froid":
-        return _clamp(softened, 0.75, 1.05), "cdh_adouci"
-    if climate_class == "tempere":
-        return _clamp(softened, 0.80, 1.12), "cdh_adouci"
-    if climate_class == "chaud":
-        return _clamp(softened, 0.85, 1.20), "cdh_adouci"
-    if climate_class == "tres_chaud":
-        return _clamp(softened, 0.95, 1.30), "cdh_adouci"
-    return _clamp(softened, 0.80, 1.20), "cdh_adouci"
+def format_chf(value: float | int | None, decimals: int = 0) -> str:
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):,.{decimals}f} CHF".replace(",", " ")
+    except Exception:
+        return "—"
 
 
-def night_ventilation_factor(*, night_ventilation: bool, station_ref: dict[str, Any] | None) -> tuple[float, str]:
-    if not night_ventilation:
-        return 1.0, "non_active"
-    base = F_NIGHT_BASE[True]
-    if station_ref is not None:
-        potential = _safe_float(station_ref.get("f_night_potential_vs_ref"), None)
-        if potential is not None and potential > 0:
-            if potential >= 1.2:
-                return 0.88, "potentiel_nocturne_bon"
-            if potential >= 0.9:
-                return 0.92, "potentiel_nocturne_moyen"
-            return 0.97, "potentiel_nocturne_faible"
-    return base, "valeur_generique"
+def format_percent(value: float | int | None, decimals: int = 0) -> str:
+    if value is None:
+        return "—"
+    try:
+        return f"{100.0 * float(value):.{decimals}f} %"
+    except Exception:
+        return "—"
 
 
-def cooling_mode_factor(cooling_mode: str) -> float:
-    mode = _norm(cooling_mode)
-    if mode == "no_cooling":
-        return 0.0
-    if mode == "free_cooling":
-        return 0.40
-    if mode == "hybrid":
-        return 0.60
-    if mode == "active_cooling":
-        return 1.00
-    return 1.00
+def format_payback(value: float | int | None) -> str:
+    if value is None:
+        return "—"
+    try:
+        return f"{float(value):.1f} ans"
+    except Exception:
+        return "—"
 
 
-def estimate_cooling_need_kwh(
-    *,
-    building_type_key: str,
-    cooling_mode: str,
-    surface_climatisee_m2: float,
-    cooling_degree_hours: float,
-    vitrage_level: str,
-    solar_protection_level: str,
-    usage_level: str,
-    night_ventilation: bool,
-    station_info: Any | None = None,
-) -> dict[str, Any]:
-    surface = _safe_float(surface_climatisee_m2, 0.0) or 0.0
-    mode = _norm(cooling_mode)
-    station_name = station_name_from_station_info(station_info)
-    station_ref = get_station_climate_reference(station_name)
-    if station_ref is not None and station_ref.get("climate_class"):
-        climate_class = normalize_climate_class(str(station_ref.get("climate_class")))
-        climate_class_source = "station_reference"
-    else:
-        climate_class = climate_class_from_cdh(cooling_degree_hours)
-        climate_class_source = "cdh_fallback"
-    typologie_calibration = normalize_calibration_typology(building_type_key)
-    if mode == "no_cooling" or surface <= 0:
-        return {
-            "typologie_calibration": typologie_calibration,
-            "climate_class": climate_class,
-            "climate_class_source": climate_class_source,
-            "station_name": station_name,
-            "q_ref_kwh_m2a": 0.0,
-            "q_ref_source": "no_cooling",
-            "f_climat": 0.0,
-            "f_climat_source": "no_cooling",
-            "f_vitrage": 1.0,
-            "f_solaire": 1.0,
-            "f_usage": 1.0,
-            "f_night": 1.0,
-            "f_night_source": "no_cooling",
-            "f_mode": 0.0,
-            "q_froid_utile_kwh_an": 0.0,
-            "q_froid_utile_kwh_m2a": 0.0,
-            "spf_froid": None,
-            "conso_elec_clim_kwh_an": 0.0,
-        }
-    q_ref, q_ref_source = get_calibrated_qref(typologie=typologie_calibration, climate_class=climate_class)
-    f_climat, f_climat_source = softened_climate_factor(climate_class=climate_class, cooling_degree_hours=cooling_degree_hours, station_ref=station_ref)
-    f_vitrage = F_VITRAGE.get(_norm(vitrage_level), 1.00)
-    f_solaire = F_SOLAIRE.get(_norm(solar_protection_level), 1.00)
-    f_usage = F_USAGE.get(_norm(usage_level), 1.00)
-    f_night, f_night_source = night_ventilation_factor(night_ventilation=night_ventilation, station_ref=station_ref)
-    f_mode = cooling_mode_factor(mode)
-    q_froid_utile = surface * q_ref * f_climat * f_vitrage * f_solaire * f_usage * f_night * f_mode
-    spf_froid = COOLING_SPF_BY_MODE.get(mode)
-    conso_elec = q_froid_utile / spf_froid if spf_froid and spf_froid > 0 else 0.0
+def format_table_float(value: float | int | None, decimals: int = 1) -> float | None:
+    if value is None:
+        return None
+    try:
+        return round(float(value), decimals)
+    except Exception:
+        return None
+
+
+# ============================================================
+# OUTILS INTERACTIFS CUMULATIFS
+# ============================================================
+
+def default_interactive_adjustments() -> dict[str, int]:
     return {
-        "typologie_calibration": typologie_calibration,
-        "climate_class": climate_class,
-        "climate_class_source": climate_class_source,
-        "station_name": station_name,
-        "q_ref_kwh_m2a": q_ref,
-        "q_ref_source": q_ref_source,
-        "f_climat": f_climat,
-        "f_climat_source": f_climat_source,
-        "f_vitrage": f_vitrage,
-        "f_solaire": f_solaire,
-        "f_usage": f_usage,
-        "f_night": f_night,
-        "f_night_source": f_night_source,
-        "f_mode": f_mode,
-        "q_froid_utile_kwh_an": q_froid_utile,
-        "q_froid_utile_kwh_m2a": q_froid_utile / surface if surface > 0 else 0.0,
-        "spf_froid": spf_froid,
-        "conso_elec_clim_kwh_an": conso_elec,
+        "current_energy_pct": 0,
+        "electricity_price_pct": 0,
+        "capex_pct": 0,
     }
 
 
-# ============================================================
-# INCERTITUDE ET INDICATEURS ÉCONOMIQUES
-# ============================================================
-
-def get_uncertainty_config(*, inputs: ProjectInputs, froid: dict[str, Any], scenario_label: str) -> dict[str, Any]:
-    cfg = UNCERTAINTY_DEFAULTS.copy()
-    if inputs.sdep_mode == "Saisie directe":
-        cfg["heating_need_sigma"] = 0.10
-    elif inputs.sdep_mode == "Estimation par périmètre":
-        cfg["heating_need_sigma"] = 0.15
-    elif inputs.sdep_mode in {"Estimation typologique calibrée", "Estimation typologique"}:
-        cfg["heating_need_sigma"] = 0.22
-    else:
-        cfg["heating_need_sigma"] = 0.22
-    typ = str(froid.get("typologie_calibration", "mixte"))
-    cfg["cooling_need_sigma"] = COOLING_SIGMA_BY_TYPOLOGY.get(typ, 0.35)
-    cooling_mode = str(froid.get("cooling_mode_effective", inputs.cooling_mode))
-    if cooling_mode == "active_cooling":
-        cfg["cooling_need_sigma"] *= 0.90
-    elif cooling_mode == "hybrid":
-        cfg["cooling_need_sigma"] *= 1.05
-    elif cooling_mode == "free_cooling":
-        cfg["cooling_need_sigma"] *= 1.20
-    elif cooling_mode == "no_cooling":
-        cfg["cooling_need_sigma"] = 0.0
-    qref_source = str(froid.get("q_ref_source", ""))
-    if qref_source.startswith("fallback"):
-        cfg["cooling_need_sigma"] *= 1.30
-    if froid.get("climate_class_source") == "cdh_fallback":
-        cfg["cooling_need_sigma"] *= 1.10
-    if not inputs.want_cooling or inputs.surface_climatisee_m2 <= 0:
-        cfg["cooling_need_sigma"] = 0.0
-    cfg["cooling_need_sigma"] = _clamp(cfg["cooling_need_sigma"], 0.0, 0.75)
-    if scenario_label == "Central":
-        cfg["price_elec_sigma"] = 0.107
-        cfg["price_fuel_sigma"] = 0.040
-    else:
-        cfg["price_elec_sigma"] = 0.107
-        cfg["price_fuel_sigma"] = 0.050
-    return cfg
+def clamp_adjustment(
+    value: int,
+    min_value: int = INTERACTIVE_ADJUSTMENT_MIN,
+    max_value: int = INTERACTIVE_ADJUSTMENT_MAX,
+) -> int:
+    return max(min_value, min(max_value, int(value)))
 
 
-def compute_confidence_level(*, inputs: ProjectInputs, froid: dict[str, Any]) -> dict[str, Any]:
-    score = 0
-    reasons_positive: list[str] = []
-    reasons_negative: list[str] = []
-    if inputs.sdep_mode == "Saisie directe":
-        score += 2
-        reasons_positive.append("Sdép et Vh saisis directement")
-    elif inputs.sdep_mode == "Estimation par périmètre":
-        score += 1
-        reasons_positive.append("géométrie estimée par périmètre")
-    elif inputs.sdep_mode in {"Estimation typologique calibrée", "Estimation typologique"}:
-        reasons_negative.append("Sdép estimée par coefficient typologique calibré")
-    else:
-        reasons_negative.append("géométrie estimée par typologie")
-    qref_source = str(froid.get("q_ref_source", ""))
-    if qref_source and not qref_source.startswith("fallback"):
-        score += 2
-        reasons_positive.append("q_ref froid issu du fichier de calibration")
-    else:
-        reasons_negative.append("q_ref froid issu d'un fallback")
-    typ = str(froid.get("typologie_calibration", ""))
-    if typ in ["bureaux", "ecole", "commerce"]:
-        score += 1
-        reasons_positive.append(f"typologie {typ} relativement mieux documentée")
-    elif typ in ["residentiel", "activites", "equipement_collectif", "mixte"]:
-        reasons_negative.append(f"typologie {typ} encore fragile")
-    if inputs.current_efficiency is not None and inputs.current_efficiency > 0:
-        score += 1
-        reasons_positive.append("rendement du système actuel renseigné")
-    else:
-        reasons_negative.append("rendement du système actuel incertain")
-    if inputs.has_existing_ac:
-        if inputs.eer_current_ac is not None and inputs.eer_current_ac > 0:
-            score += 1
-            reasons_positive.append("performance de la clim actuelle renseignée")
-        else:
-            reasons_negative.append("clim actuelle présente mais performance inconnue")
-    if score >= 5:
-        level = "élevé"
-    elif score >= 3:
-        level = "moyen"
-    else:
-        level = "faible"
-    return {"level": level, "score": score, "reasons_positive": reasons_positive, "reasons_negative": reasons_negative}
+def adjustment_factor(pct: int | float) -> float:
+    return 1.0 + float(pct) / 100.0
 
 
-def compute_economic_indicators(
-    *,
-    cost_ref_series: pd.Series | None,
-    cost_pac_series: pd.Series | None,
-    capex_net: float,
-    discount_rate: float = UNCERTAINTY_DISCOUNT_RATE,
-    payback_max_years: int = UNCERTAINTY_PAYBACK_MAX_YEARS,
-) -> dict[str, Any]:
-    """
-    Calcule les coûts de première année et, lorsqu'un système de référence
-    existe, les indicateurs comparatifs de rentabilité.
+def update_interactive_adjustment(key: str, delta: int) -> None:
+    if "interactive_adjustments" not in st.session_state:
+        st.session_state["interactive_adjustments"] = default_interactive_adjustments()
 
-    Pour un nouveau bâtiment, cost_ref_series est volontairement absente.
-    Le coût de fonctionnement de la PAC doit néanmoins rester disponible.
-    """
-    cout_pac_year0 = None
-    if cost_pac_series is not None and len(cost_pac_series) > 0:
-        cout_pac_year0 = float(cost_pac_series.iloc[0])
+    current = st.session_state["interactive_adjustments"].get(key, 0)
+    st.session_state["interactive_adjustments"][key] = clamp_adjustment(current + delta)
 
-    if cost_ref_series is None or len(cost_ref_series) == 0:
-        return {
-            "cout_ref_year0": None,
-            "cout_pac_year0": cout_pac_year0,
-            "economies_year0": None,
-            "payback": None,
-            "npv": None,
-        }
 
-    if cout_pac_year0 is None:
-        return {
-            "cout_ref_year0": float(cost_ref_series.iloc[0]),
-            "cout_pac_year0": None,
-            "economies_year0": None,
-            "payback": None,
-            "npv": None,
-        }
+def reset_interactive_adjustments() -> None:
+    st.session_state["interactive_adjustments"] = default_interactive_adjustments()
 
-    cout_ref_year0 = float(cost_ref_series.iloc[0])
-    economies_year0 = cout_ref_year0 - cout_pac_year0
 
-    res_pb_standard = payback_discounted_from_cashflows(
-        capex_chf=capex_net,
-        cost_ref=cost_ref_series,
-        cost_new=cost_pac_series,
-        discount_rate=discount_rate,
+def render_interactive_adjustment_controls(results: dict) -> dict[str, int]:
+    inputs = results["inputs"]
+    current_energy_label = inputs.current_energy or "énergie actuelle"
+
+    if "interactive_adjustments" not in st.session_state:
+        st.session_state["interactive_adjustments"] = default_interactive_adjustments()
+
+    adj = st.session_state["interactive_adjustments"]
+
+    # Compatibilité avec d'anciens résultats de session qui utilisaient "pac_annual_pct".
+    if "electricity_price_pct" not in adj:
+        adj["electricity_price_pct"] = int(adj.get("pac_annual_pct", 0))
+    adj.pop("pac_annual_pct", None)
+
+    st.markdown("#### Tester rapidement des variations cumulées")
+    st.caption(
+        "Chaque clic modifie le paramètre de 10 points de pourcentage. "
+        "Chaque paramètre est borné entre -30 % et +30 %. Les variations se cumulent."
     )
-    npv = res_pb_standard.get("npv")
 
-    cost_ref_extended = _series_first_n_years(cost_ref_series, payback_max_years)
-    cost_pac_extended = _series_first_n_years(cost_pac_series, payback_max_years)
-    payback_extended = discounted_payback_from_annual_savings(
+    is_current_system_electric = current_energy_label in {
+        "Électricité (réseau)",
+        "Electricité (réseau)",
+        "Electricite (réseau)",
+        "Electricite",
+        "Électricité",
+    }
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        if is_current_system_electric:
+            # Pas de doublon : le prix de l'électricité est déjà piloté par le bouton dédié.
+            adj["current_energy_pct"] = 0
+
+            st.markdown("**Prix énergie actuelle**")
+            st.caption(
+                "Non affiché : le système actuel utilise déjà l'électricité. "
+                "La variation est gérée par le bouton Prix électricité."
+            )
+        else:
+            st.markdown(f"**Prix {current_energy_label}**")
+            b1, b2 = st.columns(2)
+            with b1:
+                if st.button("-10 %", key="btn_current_energy_minus_10"):
+                    update_interactive_adjustment("current_energy_pct", -INTERACTIVE_ADJUSTMENT_STEP)
+                    st.rerun()
+            with b2:
+                if st.button("+10 %", key="btn_current_energy_plus_10"):
+                    update_interactive_adjustment("current_energy_pct", INTERACTIVE_ADJUSTMENT_STEP)
+                    st.rerun()
+            st.caption(f"Variation actuelle : {adj.get('current_energy_pct', 0):+d} %")
+
+    with c2:
+        st.markdown("**Prix électricité**")
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("-10 %", key="btn_electricity_price_minus_10"):
+                update_interactive_adjustment("electricity_price_pct", -INTERACTIVE_ADJUSTMENT_STEP)
+                st.rerun()
+        with b2:
+            if st.button("+10 %", key="btn_electricity_price_plus_10"):
+                update_interactive_adjustment("electricity_price_pct", INTERACTIVE_ADJUSTMENT_STEP)
+                st.rerun()
+        st.caption(f"Variation actuelle : {adj.get('electricity_price_pct', 0):+d} %")
+
+    with c3:
+        st.markdown("**CAPEX net**")
+        b1, b2 = st.columns(2)
+        with b1:
+            if st.button("-10 %", key="btn_capex_minus_10"):
+                update_interactive_adjustment("capex_pct", -INTERACTIVE_ADJUSTMENT_STEP)
+                st.rerun()
+        with b2:
+            if st.button("+10 %", key="btn_capex_plus_10"):
+                update_interactive_adjustment("capex_pct", INTERACTIVE_ADJUSTMENT_STEP)
+                st.rerun()
+        st.caption(f"Variation actuelle : {adj.get('capex_pct', 0):+d} %")
+
+    if st.button("Réinitialiser les variations", key="btn_reset_interactive_adjustments"):
+        reset_interactive_adjustments()
+        st.rerun()
+
+    adj = st.session_state["interactive_adjustments"]
+
+    current_energy_part = ""
+    if not is_current_system_electric:
+        current_energy_part = f"{current_energy_label} {adj.get('current_energy_pct', 0):+d} %, "
+
+    st.info(
+        f"Hypothèse affichée : "
+        f"{current_energy_part}"
+        f"électricité {adj.get('electricity_price_pct', 0):+d} %, "
+        f"CAPEX net {adj.get('capex_pct', 0):+d} %."
+    )
+
+    return adj
+
+
+def discounted_cumulative_series(
+    annual_costs: pd.Series,
+    discount_rate: float = DISCOUNT_RATE_DISPLAY,
+    initial_cost: float = 0.0,
+) -> pd.Series:
+    values = []
+    cumulative = float(initial_cost)
+
+    for i, value in enumerate(annual_costs, start=1):
+        cumulative += float(value) / ((1.0 + discount_rate) ** i)
+        values.append(cumulative)
+
+    return pd.Series(values, index=annual_costs.index)
+
+
+def first_n_years_series(series: pd.Series, n_years: int) -> pd.Series:
+    """Garde les n premières années d'une série de coûts.
+
+    Le cas déterministe du modèle est évalué sur l'horizon économique de 25 ans.
+    Le graphique interactif doit donc utiliser le même horizon pour que la VAN
+    affichée avec les boutons à 0 % corresponde à la VAN estimée plus haut.
+    """
+    s = pd.Series(series).copy()
+    s = pd.to_numeric(s, errors="coerce")
+    s = s.replace([float("inf"), float("-inf")], pd.NA)
+    s = s.interpolate(method="linear", limit_direction="both").ffill().bfill()
+    return s.astype(float).iloc[: int(n_years)].copy()
+
+
+def economic_horizon_years_from_results(central: dict) -> int:
+    """Retourne l'horizon économique utilisé pour la VAN.
+
+    On lit l'horizon dans le bloc d'incertitude quand il est disponible.
+    Sinon, on retombe sur la valeur du mémoire : 25 ans.
+    """
+    try:
+        unc = central.get("uncertainty", {})
+        horizon = int(unc.get("horizon_years", ECONOMIC_HORIZON_DISPLAY_YEARS))
+        if horizon > 0:
+            return horizon
+    except Exception:
+        pass
+    return ECONOMIC_HORIZON_DISPLAY_YEARS
+
+
+def local_discounted_payback(
+    *,
+    capex_net: float,
+    cost_ref: pd.Series,
+    cost_pac: pd.Series,
+    discount_rate: float = DISCOUNT_RATE_DISPLAY,
+) -> float | None:
+    cumulative = -float(capex_net)
+
+    for i, saving in enumerate(cost_ref - cost_pac, start=1):
+        discounted_saving = float(saving) / ((1.0 + discount_rate) ** i)
+        previous = cumulative
+        cumulative += discounted_saving
+
+        if cumulative >= 0:
+            if discounted_saving <= 0:
+                return float(i)
+
+            fraction = abs(previous) / discounted_saving
+            return float((i - 1) + fraction)
+
+    return None
+
+
+def render_interactive_cumulative_cost_chart(
+    *,
+    central: dict,
+    pac: dict,
+    adjustments: dict,
+    discount_rate: float = DISCOUNT_RATE_DISPLAY,
+) -> dict:
+    try:
+        import plotly.graph_objects as go
+    except ModuleNotFoundError:
+        st.error("Plotly n'est pas installé. Lance : py -m pip install plotly")
+        return {"payback": None, "van_recalculee": None, "capex_net": None}
+
+    current_energy_factor = adjustment_factor(adjustments.get("current_energy_pct", 0))
+    electricity_price_factor = adjustment_factor(adjustments.get("electricity_price_pct", 0))
+    capex_factor = adjustment_factor(adjustments.get("capex_pct", 0))
+
+    # ========================================================
+    # Système actuel
+    # ========================================================
+    # Version rigoureuse : on ne multiplie par le facteur "énergie actuelle"
+    # que la partie énergie de chauffage, pas la maintenance.
+    # La partie froid existante éventuelle est électrique, donc elle suit le
+    # facteur du prix de l'électricité.
+    if (
+        central.get("cost_actuel_heat_energy_series") is not None
+        and central.get("cost_actuel_cool_series") is not None
+        and central.get("om_actuel_series") is not None
+    ):
+        cost_actuel_heat = pd.Series(central["cost_actuel_heat_energy_series"]).astype(float)
+        cost_actuel_cool = pd.Series(central["cost_actuel_cool_series"]).astype(float)
+        om_actuel = pd.Series(central["om_actuel_series"]).astype(float)
+
+        cost_ref = (
+            cost_actuel_heat * current_energy_factor
+            + cost_actuel_cool * electricity_price_factor
+            + om_actuel
+        )
+    else:
+        # Fallback ancien format : on ne dispose pas du détail énergie/maintenance.
+        cost_ref_base = pd.Series(central["cost_actuel_total_series"]).astype(float)
+        cost_ref = cost_ref_base * current_energy_factor
+
+    # ========================================================
+    # PAC géothermique
+    # ========================================================
+    # Version rigoureuse : le bouton "Prix électricité" modifie uniquement
+    # l'électricité consommée par la PAC pour le chauffage et le froid.
+    # La maintenance PAC reste inchangée.
+    if (
+        central.get("cost_pac_heat_energy_series") is not None
+        and central.get("cost_pac_cool_series") is not None
+        and central.get("om_pac_series") is not None
+    ):
+        cost_pac_heat = pd.Series(central["cost_pac_heat_energy_series"]).astype(float)
+        cost_pac_cool = pd.Series(central["cost_pac_cool_series"]).astype(float)
+        om_pac = pd.Series(central["om_pac_series"]).astype(float)
+
+        cost_pac = (
+            cost_pac_heat * electricity_price_factor
+            + cost_pac_cool * electricity_price_factor
+            + om_pac
+        )
+    else:
+        # Fallback ancien format : moins rigoureux, mais évite de casser l'interface
+        # si calcul_projet.py ne retourne pas encore les séries séparées.
+        cost_pac_base = pd.Series(central["cost_pac_total_series"]).astype(float)
+        cost_pac = cost_pac_base * electricity_price_factor
+
+    horizon_years = economic_horizon_years_from_results(central)
+    cost_ref = first_n_years_series(cost_ref, horizon_years)
+    cost_pac = first_n_years_series(cost_pac, horizon_years)
+
+    capex_net = float(pac["capex_net"]) * capex_factor
+
+    cum_ref = discounted_cumulative_series(
+        cost_ref,
+        discount_rate=discount_rate,
+        initial_cost=0.0,
+    )
+
+    cum_pac = discounted_cumulative_series(
+        cost_pac,
+        discount_rate=discount_rate,
+        initial_cost=capex_net,
+    )
+
+    payback = local_discounted_payback(
         capex_net=capex_net,
-        annual_savings=cost_ref_extended - cost_pac_extended,
+        cost_ref=cost_ref,
+        cost_pac=cost_pac,
         discount_rate=discount_rate,
     )
 
-    return {
-        "cout_ref_year0": cout_ref_year0,
-        "cout_pac_year0": cout_pac_year0,
-        "economies_year0": economies_year0,
-        "payback": payback_extended,
-        "npv": npv,
-    }
+    total_ref = float(cum_ref.iloc[-1])
+    total_pac = float(cum_pac.iloc[-1])
+    van_recalculee = total_ref - total_pac
 
+    # Si tous les boutons sont neutres, la VAN recalculée doit être exactement
+    # la même que la VAN du cas déterministe affichée plus haut. On réutilise
+    # donc la valeur centrale déjà calculée par calcul_projet.py pour éviter
+    # tout écart d'arrondi ou d'horizon.
+    if (
+        int(adjustments.get("current_energy_pct", 0)) == 0
+        and int(adjustments.get("electricity_price_pct", 0)) == 0
+        and int(adjustments.get("capex_pct", 0)) == 0
+        and central.get("npv") is not None
+    ):
+        try:
+            van_recalculee = float(central["npv"])
+        except Exception:
+            pass
 
-def monte_carlo_project_uncertainty(
-    *,
-    inputs: ProjectInputs,
-    froid: dict[str, Any],
-    scenario_label: str,
-    p_elec: pd.Series,
-    p_actuel_heat: pd.Series,
-    besoin_chauffage_kwh: float,
-    besoin_froid_utile_kwh: float,
-    capex_brut: float,
-    subvention: float,
-    spf_heat: float,
-    spf_cool: float | None,
-    om_pac_chf_per_year: float,
-    om_ref_chf_per_year: float,
-    current_efficiency: float,
-    has_existing_ac: bool,
-    eer_current_ac: float | None,
-    n_sims: int = UNCERTAINTY_N_SIMS,
-    horizon_years: int = UNCERTAINTY_PROJECT_LIFETIME_YEARS,
-    payback_max_years: int = UNCERTAINTY_PAYBACK_MAX_YEARS,
-    discount_rate: float = UNCERTAINTY_DISCOUNT_RATE,
-    seed: int = 42,
-) -> dict[str, Any]:
-    import numpy as np
-    if p_elec is None or p_actuel_heat is None:
-        return {"available": False, "reason": "series_prix_absentes"}
-    if current_efficiency is None or current_efficiency <= 0:
-        return {"available": False, "reason": "rendement_reference_invalide"}
-    if spf_heat is None or spf_heat <= 0:
-        return {"available": False, "reason": "spf_chauffage_invalide"}
-    rng = np.random.default_rng(seed)
-    cfg = get_uncertainty_config(inputs=inputs, froid=froid, scenario_label=scenario_label)
-    confidence = compute_confidence_level(inputs=inputs, froid=froid)
-    p_elec_life = _series_first_n_years(p_elec, horizon_years)
-    p_ref_life = _series_first_n_years(p_actuel_heat, horizon_years)
-    p_elec_payback = _series_first_n_years(p_elec, payback_max_years)
-    p_ref_payback = _series_first_n_years(p_actuel_heat, payback_max_years)
-    capex_factors = [_triangular_factor(rng, cfg["capex_min"], cfg["capex_mode"], cfg["capex_max"]) for _ in range(n_sims)]
-    capex_factors = _normalize_factors_to_median_one(capex_factors)
-    paybacks_extended: list[float] = []
-    paybacks_within_life: list[float] = []
-    npvs_life: list[float] = []
-    annual_saving_year0: list[float] = []
-    capex_net_samples: list[float] = []
-    heat_need_samples: list[float] = []
-    cool_need_samples: list[float] = []
-    amortized_within_life_flags: list[bool] = []
-    amortized_within_extended_flags: list[bool] = []
-    for i_sim in range(n_sims):
-        f_heat_need = _bounded_lognormal_factor(rng, sigma=cfg["heating_need_sigma"], low=cfg["heating_need_min"], high=cfg["heating_need_max"])
-        if cfg["cooling_need_sigma"] > 0:
-            f_cool_need = _bounded_lognormal_factor(rng, sigma=cfg["cooling_need_sigma"], low=cfg["cooling_need_min"], high=cfg["cooling_need_max"])
-        else:
-            f_cool_need = 1.0
-        heat_need_i = max(0.0, float(besoin_chauffage_kwh) * f_heat_need)
-        cool_need_i = max(0.0, float(besoin_froid_utile_kwh) * f_cool_need)
-        capex_brut_i = max(0.0, float(capex_brut) * capex_factors[i_sim])
-        subvention_i = min(float(subvention), capex_brut_i)
-        capex_net_i = max(0.0, capex_brut_i - subvention_i)
-        f_spf_heat = _triangular_factor(rng, cfg["spf_heat_min"], cfg["spf_heat_mode"], cfg["spf_heat_max"])
-        spf_heat_i = max(0.1, float(spf_heat) * f_spf_heat)
-        if spf_cool is not None and spf_cool > 0:
-            f_spf_cool = _triangular_factor(rng, cfg["spf_cool_min"], cfg["spf_cool_mode"], cfg["spf_cool_max"])
-            spf_cool_i = max(0.1, float(spf_cool) * f_spf_cool)
-        else:
-            spf_cool_i = None
-        # Prix de l'électricité : incertitude calibrée sur les variations
-        # annuelles cantonales ElCom 2011--2026 (sigma log ≈ 0.107,
-        # bornes empiriques ≈ P5--P95 : 0.90--1.30).
-        f_price_elec = _bounded_lognormal_factor(
-            rng,
-            sigma=cfg["price_elec_sigma"],
-            low=0.90,
-            high=1.30,
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Scatter(
+            x=list(cum_ref.index),
+            y=list(cum_ref.values),
+            mode="lines+markers",
+            name="Système actuel",
+            hovertemplate="Année %{x}<br>Coût cumulé %{y:,.0f} CHF<extra></extra>",
         )
-        p_elec_life_i = p_elec_life * f_price_elec
-        p_elec_payback_i = p_elec_payback * f_price_elec
+    )
 
-        # Prix de l'énergie actuelle :
-        # - gaz/mazout : prime de risque fossile + bruit cumulatif + chocs temporaires ;
-        # - autres énergies : bruit résiduel simple.
-        if inputs.current_energy in FOSSIL_ENERGY_LABELS:
-            fossil_mult_payback = build_fossil_price_risk_multiplier(
-                rng=rng,
-                n_years=len(p_ref_payback),
-                energy_label=inputs.current_energy,
-            )
+    fig.add_trace(
+        go.Scatter(
+            x=list(cum_pac.index),
+            y=list(cum_pac.values),
+            mode="lines+markers",
+            name="PAC géothermique",
+            hovertemplate="Année %{x}<br>Coût cumulé %{y:,.0f} CHF<extra></extra>",
+        )
+    )
 
-            fossil_mult_payback_s = pd.Series(
-                fossil_mult_payback,
-                index=p_ref_payback.index,
-            )
+    if payback is not None:
+        try:
+            first_year = float(cum_ref.index[0])
 
-            fossil_mult_life_s = fossil_mult_payback_s.iloc[:len(p_ref_life)].copy()
-            fossil_mult_life_s.index = p_ref_life.index
-
-            p_ref_life_i = p_ref_life * fossil_mult_life_s
-            p_ref_payback_i = p_ref_payback * fossil_mult_payback_s
-
-        else:
-            f_price_ref = _bounded_lognormal_factor(
-                rng,
-                sigma=cfg["price_fuel_sigma"],
-                low=0.85,
-                high=1.20,
-            )
-            p_ref_life_i = p_ref_life * f_price_ref
-            p_ref_payback_i = p_ref_payback * f_price_ref
-        f_om_pac_random = _triangular_factor(rng, cfg["om_min"], cfg["om_mode"], cfg["om_max"])
-        f_om_ref_random = _triangular_factor(rng, cfg["om_min"], cfg["om_mode"], cfg["om_max"])
-        f_om_correlated = f_heat_need ** cfg["om_heat_need_elasticity"]
-        om_pac_i = max(0.0, float(om_pac_chf_per_year) * f_om_pac_random * f_om_correlated)
-        om_ref_i = max(0.0, float(om_ref_chf_per_year) * f_om_ref_random * f_om_correlated)
-        def build_savings_series(p_elec_i: pd.Series, p_ref_i: pd.Series) -> pd.Series:
-            cost_pac_heat_i = (heat_need_i / spf_heat_i) * p_elec_i
-            if cool_need_i > 0 and spf_cool_i is not None:
-                cost_pac_cool_i = (cool_need_i / spf_cool_i) * p_elec_i
+            # Si la première valeur de l'axe est une année calendrier,
+            # on convertit le temps de retour en année affichée.
+            # Exemple : première année 2026, retour 22.9 ans -> 2047.9.
+            if first_year > 1900:
+                payback_x = first_year + float(payback) - 1.0
             else:
-                cost_pac_cool_i = pd.Series(0.0, index=p_elec_i.index)
-            cost_pac_i = cost_pac_heat_i.add(cost_pac_cool_i, fill_value=0.0).add(om_pac_i, fill_value=0.0)
-            cost_ref_heat_i = (heat_need_i / float(current_efficiency)) * p_ref_i
-            if has_existing_ac and cool_need_i > 0 and eer_current_ac is not None and eer_current_ac > 0:
-                cost_ref_cool_i = (cool_need_i / float(eer_current_ac)) * p_elec_i
-            else:
-                cost_ref_cool_i = pd.Series(0.0, index=p_elec_i.index)
-            cost_ref_i = cost_ref_heat_i.add(cost_ref_cool_i, fill_value=0.0).add(om_ref_i, fill_value=0.0)
-            return cost_ref_i - cost_pac_i
-        savings_life_i = build_savings_series(p_elec_life_i, p_ref_life_i)
-        savings_payback_i = build_savings_series(p_elec_payback_i, p_ref_payback_i)
-        pb_life = discounted_payback_from_annual_savings(capex_net=capex_net_i, annual_savings=savings_life_i, discount_rate=discount_rate)
-        pb_extended = discounted_payback_from_annual_savings(capex_net=capex_net_i, annual_savings=savings_payback_i, discount_rate=discount_rate)
-        van_life = npv_from_annual_savings(capex_net=capex_net_i, annual_savings=savings_life_i, discount_rate=discount_rate)
-        capex_net_samples.append(capex_net_i)
-        heat_need_samples.append(heat_need_i)
-        cool_need_samples.append(cool_need_i)
-        npvs_life.append(van_life)
-        annual_saving_year0.append(float(savings_life_i.iloc[0]))
-        if pb_life is not None:
-            amortized_within_life_flags.append(True)
-            paybacks_within_life.append(pb_life)
-        else:
-            amortized_within_life_flags.append(False)
-        if pb_extended is not None:
-            amortized_within_extended_flags.append(True)
-            paybacks_extended.append(pb_extended)
-        else:
-            amortized_within_extended_flags.append(False)
-    n_amortized_life = sum(amortized_within_life_flags)
-    n_not_amortized_life = len(amortized_within_life_flags) - n_amortized_life
-    n_amortized_extended = sum(amortized_within_extended_flags)
-    n_not_amortized_extended = len(amortized_within_extended_flags) - n_amortized_extended
-    n_valid_npv_life = sum(1 for v in npvs_life if v is not None and math.isfinite(float(v)))
-    amortization_probability_life = n_amortized_life / len(amortized_within_life_flags) if amortized_within_life_flags else 0.0
-    amortization_probability_extended = n_amortized_extended / len(amortized_within_extended_flags) if amortized_within_extended_flags else 0.0
+                payback_x = float(payback)
+
+            x_min = min(float(cum_ref.index[0]), float(cum_pac.index[0]))
+            x_max = max(float(cum_ref.index[-1]), float(cum_pac.index[-1]))
+
+            if x_min <= payback_x <= x_max:
+                fig.add_vline(
+                    x=payback_x,
+                    line_dash="dash",
+                    annotation_text=f"Retour ≈ {payback:.1f} ans",
+                    annotation_position="top",
+                )
+
+        except Exception:
+            pass
+
+    fig.update_layout(
+        title="Coûts cumulés actualisés — hypothèse interactive",
+        xaxis_title="Année",
+        yaxis_title="Coût cumulé actualisé (CHF)",
+        hovermode="x unified",
+        legend_title="Système",
+        margin=dict(l=30, r=30, t=60, b=30),
+    )
+
+    try:
+        fig.update_xaxes(
+            range=[
+                float(cum_ref.index[0]),
+                float(cum_ref.index[-1]),
+            ]
+        )
+    except Exception:
+        pass
+
+    st.plotly_chart(fig, use_container_width=True)
+
     return {
-        "available": True,
-        "method": "monte_carlo_central_chocs_fossiles_historiques_mean_reverting",
-        "n_sims": n_sims,
-        "horizon_years": horizon_years,
-        "payback_max_years": payback_max_years,
-        "discount_rate": discount_rate,
-        "confidence": confidence,
-        "payback_p10": _finite_percentile(paybacks_extended, 10),
-        "payback_p20": _finite_percentile(paybacks_extended, 20),
-        "payback_p50": _finite_percentile(paybacks_extended, 50),
-        "payback_p80": _finite_percentile(paybacks_extended, 80),
-        "payback_p90": _finite_percentile(paybacks_extended, 90),
-        "payback_mean": float(np.mean(paybacks_extended)) if paybacks_extended else None,
-        "payback_median_representative": _median_is_representative(paybacks_extended, n_sims),
-        "amortization_probability": amortization_probability_life,
-        "amortization_probability_life": amortization_probability_life,
-        "amortization_probability_extended": amortization_probability_extended,
-        "probability_payback_le_25y": _share_below(paybacks_extended, 25.0, n_sims),
-        "probability_payback_le_30y": _share_below(paybacks_extended, 30.0, n_sims),
-        "probability_payback_le_40y": _share_below(paybacks_extended, 40.0, n_sims),
-        "probability_payback_le_50y": _share_below(paybacks_extended, 50.0, n_sims),
-        "n_amortized": n_amortized_life,
-        "n_not_amortized": n_not_amortized_life,
-        "n_amortized_life": n_amortized_life,
-        "n_not_amortized_life": n_not_amortized_life,
-        "n_amortized_extended": n_amortized_extended,
-        "n_not_amortized_extended": n_not_amortized_extended,
-        "n_valid_npv_life": n_valid_npv_life,
-        "npv_p10": _finite_percentile(npvs_life, 10),
-        "npv_p50": _finite_percentile(npvs_life, 50),
-        "npv_p90": _finite_percentile(npvs_life, 90),
-        "annual_saving_year0_p10": _finite_percentile(annual_saving_year0, 10),
-        "annual_saving_year0_p50": _finite_percentile(annual_saving_year0, 50),
-        "annual_saving_year0_p90": _finite_percentile(annual_saving_year0, 90),
-        "capex_net_p10": _finite_percentile(capex_net_samples, 10),
-        "capex_net_p50": _finite_percentile(capex_net_samples, 50),
-        "capex_net_p90": _finite_percentile(capex_net_samples, 90),
-        "heating_need_p10": _finite_percentile(heat_need_samples, 10),
-        "heating_need_p50": _finite_percentile(heat_need_samples, 50),
-        "heating_need_p90": _finite_percentile(heat_need_samples, 90),
-        "cooling_need_p10": _finite_percentile(cool_need_samples, 10),
-        "cooling_need_p50": _finite_percentile(cool_need_samples, 50),
-        "cooling_need_p90": _finite_percentile(cool_need_samples, 90),
-        "simulation_samples": {
-            "paybacks_extended": paybacks_extended,
-            "paybacks_within_life": paybacks_within_life,
-            "npvs_life": npvs_life,
-            "annual_saving_year0": annual_saving_year0,
-            "capex_net": capex_net_samples,
-            "heating_need": heat_need_samples,
-            "cooling_need": cool_need_samples,
-        },
-        "assumptions": {
-            "heating_need_sigma": cfg["heating_need_sigma"],
-            "cooling_need_sigma": cfg["cooling_need_sigma"],
-            "heating_need_bounds": [cfg["heating_need_min"], cfg["heating_need_max"]],
-            "cooling_need_bounds": [cfg["cooling_need_min"], cfg["cooling_need_max"]],
-            "capex_range": [cfg["capex_min"], cfg["capex_mode"], cfg["capex_max"]],
-            "subsidy_randomized": False,
-            "spf_heat_range": [cfg["spf_heat_min"], cfg["spf_heat_mode"], cfg["spf_heat_max"]],
-            "spf_cool_range": [cfg["spf_cool_min"], cfg["spf_cool_mode"], cfg["spf_cool_max"]],
-            "price_elec_sigma": cfg["price_elec_sigma"],
-            "price_elec_bounds": [0.90, 1.30],
-            "price_fuel_sigma": cfg["price_fuel_sigma"],
-            "om_range": [cfg["om_min"], cfg["om_mode"], cfg["om_max"]],
-            "capex_heat_need_elasticity": cfg["capex_heat_need_elasticity"],
-            "om_heat_need_elasticity": cfg["om_heat_need_elasticity"],
-            "capex_factors_normalized_to_median_one": True,
-            "fossil_risk_applied": inputs.current_energy in FOSSIL_ENERGY_LABELS,
-            "fossil_risk_model": (
-                {
-                    **FOSSIL_RISK_PREMIUM.get(inputs.current_energy),
-                    "interpretation": (
-                        "Paramètres calibrés à partir des rendements annuels historiques. "
-                        "Le drift est fixé à zéro pour éviter de doubler la tendance déjà "
-                        "présente dans la trajectoire centrale."
-                    ),
-                }
-                if inputs.current_energy in FOSSIL_ENERGY_LABELS
-                else None
-            ),
-        },
+        "payback": payback,
+        "van_recalculee": van_recalculee,
+        "capex_net": capex_net,
     }
-
-
-def compute_one_at_a_time_sensitivity(
-    *,
-    capex_net: float,
-    besoin_chauffage_kwh: float,
-    energie_froid_utile_kwh: float,
-    p_elec: pd.Series,
-    p_actuel_heat: pd.Series,
-    spf_heat: float,
-    spf_cool: float | None,
-    current_efficiency: float,
-    has_existing_ac: bool,
-    eer_current_ac: float | None,
-    om_pac_chf_per_year: float,
-    om_ref_chf_per_year: float,
-    discount_rate: float = UNCERTAINTY_DISCOUNT_RATE,
-) -> list[dict[str, Any]]:
-    def rebuild_costs(
-        *,
-        capex_factor: float = 1.0,
-        elec_price_factor: float = 1.0,
-        ref_energy_price_factor: float = 1.0,
-        spf_heat_factor: float = 1.0,
-        heat_need_factor: float = 1.0,
-        cooling_need_factor: float = 1.0,
-        om_factor: float = 1.0,
-    ) -> dict[str, Any]:
-        heat_need_i = max(0.0, float(besoin_chauffage_kwh) * heat_need_factor)
-        cool_need_i = max(0.0, float(energie_froid_utile_kwh) * cooling_need_factor)
-        p_elec_i = p_elec * elec_price_factor
-        p_ref_i = p_actuel_heat * ref_energy_price_factor
-        spf_heat_i = max(0.1, float(spf_heat) * spf_heat_factor)
-        cost_pac_heat_i = (heat_need_i / spf_heat_i) * p_elec_i
-        if cool_need_i > 0 and spf_cool is not None and spf_cool > 0:
-            cost_pac_cool_i = (cool_need_i / spf_cool) * p_elec_i
-        else:
-            cost_pac_cool_i = pd.Series(0.0, index=p_elec_i.index)
-        cost_pac_total_i = cost_pac_heat_i.add(cost_pac_cool_i, fill_value=0.0).add(float(om_pac_chf_per_year) * om_factor, fill_value=0.0)
-        cost_ref_heat_i = (heat_need_i / float(current_efficiency)) * p_ref_i
-        if has_existing_ac and cool_need_i > 0 and eer_current_ac is not None and eer_current_ac > 0:
-            cost_ref_cool_i = (cool_need_i / float(eer_current_ac)) * p_elec_i
-        else:
-            cost_ref_cool_i = pd.Series(0.0, index=p_elec_i.index)
-        cost_ref_total_i = cost_ref_heat_i.add(cost_ref_cool_i, fill_value=0.0).add(float(om_ref_chf_per_year) * om_factor, fill_value=0.0)
-        return compute_economic_indicators(cost_ref_series=cost_ref_total_i, cost_pac_series=cost_pac_total_i, capex_net=float(capex_net) * capex_factor, discount_rate=discount_rate)
-    central = rebuild_costs()
-    sensitivity_specs = [
-        {"parametre": "Prix électricité", "low_label": "-20 %", "high_label": "+20 %", "low_kwargs": {"elec_price_factor": 0.80}, "high_kwargs": {"elec_price_factor": 1.20}},
-        {"parametre": "Prix énergie actuelle", "low_label": "-20 %", "high_label": "+20 %", "low_kwargs": {"ref_energy_price_factor": 0.80}, "high_kwargs": {"ref_energy_price_factor": 1.20}},
-        {"parametre": "CAPEX net", "low_label": "-15 %", "high_label": "+15 %", "low_kwargs": {"capex_factor": 0.85}, "high_kwargs": {"capex_factor": 1.15}},
-        {"parametre": "SPF chauffage PAC", "low_label": "-10 %", "high_label": "+10 %", "low_kwargs": {"spf_heat_factor": 0.90}, "high_kwargs": {"spf_heat_factor": 1.10}},
-        {"parametre": "Besoin chauffage", "low_label": "-15 %", "high_label": "+15 %", "low_kwargs": {"heat_need_factor": 0.85}, "high_kwargs": {"heat_need_factor": 1.15}},
-        {"parametre": "Besoin froid", "low_label": "-30 %", "high_label": "+30 %", "low_kwargs": {"cooling_need_factor": 0.70}, "high_kwargs": {"cooling_need_factor": 1.30}},
-        {"parametre": "Maintenance", "low_label": "-15 %", "high_label": "+15 %", "low_kwargs": {"om_factor": 0.85}, "high_kwargs": {"om_factor": 1.15}},
-    ]
-    rows = []
-    for spec in sensitivity_specs:
-        low = rebuild_costs(**spec["low_kwargs"])
-        high = rebuild_costs(**spec["high_kwargs"])
-        if central["payback"] is not None and low["payback"] is not None and high["payback"] is not None:
-            impact_payback_abs = max(abs(float(low["payback"]) - float(central["payback"])), abs(float(high["payback"]) - float(central["payback"])))
-        else:
-            impact_payback_abs = None
-        if central["npv"] is not None and low["npv"] is not None and high["npv"] is not None:
-            impact_npv_abs = max(abs(float(low["npv"]) - float(central["npv"])), abs(float(high["npv"]) - float(central["npv"])))
-        else:
-            impact_npv_abs = None
-        rows.append({
-            "parametre": spec["parametre"],
-            "variation_basse": spec["low_label"],
-            "payback_bas": low["payback"],
-            "npv_bas": low["npv"],
-            "variation_centrale": "central",
-            "payback_central": central["payback"],
-            "npv_central": central["npv"],
-            "variation_haute": spec["high_label"],
-            "payback_haut": high["payback"],
-            "npv_haut": high["npv"],
-            "impact_payback_abs": impact_payback_abs,
-            "impact_npv_abs": impact_npv_abs,
-        })
-    return sorted(rows, key=lambda r: r["impact_npv_abs"] if r["impact_npv_abs"] is not None else -1, reverse=True)
 
 
 # ============================================================
-# ÉVALUATION PROJET
+# GRAPHIQUES MONTE CARLO
 # ============================================================
 
-def evaluer_projet(inputs: ProjectInputs) -> dict[str, Any]:
-    postcode_meta = postcode_info(inputs.postcode)
-    canton_from_postcode = postcode_meta["canton_name"]
-    if inputs.canton != canton_from_postcode:
-        inputs.canton = canton_from_postcode
-    is_replacement = project_requires_reference_system(inputs.project_type)
-    building_type_price = _get_price_building_type(inputs.building_type_key)
-    station_info = nearest_station_for_postcode(inputs.postcode)
-    res_ch = calcul_pointe_et_energie_annuelle(postcode=inputs.postcode, ubat=inputs.ubat, sdep_m2=float(inputs.sdep_m2), ventilation_r=inputs.ventilation_r, vh_m3=float(inputs.vh_m3))
-    besoin_total = float(res_ch["energie_annuelle_kwh"])
-    p_max_kw = float(res_ch["p_pointe_kw"])
-    cooling_hours = cooling_hours_for_postcode(inputs.postcode)
-    cooling_degree_hours = cooling_degree_hours_for_postcode(inputs.postcode)
-    effective_cooling_mode = inputs.cooling_mode
-    if not inputs.want_cooling:
-        effective_cooling_mode = "no_cooling"
-    cool_res = estimate_cooling_need_kwh(building_type_key=inputs.building_type_key, cooling_mode=effective_cooling_mode, surface_climatisee_m2=inputs.surface_climatisee_m2, cooling_degree_hours=cooling_degree_hours, vitrage_level=inputs.vitrage_level, solar_protection_level=inputs.solar_protection_level, usage_level=inputs.usage_level, night_ventilation=inputs.night_ventilation, station_info=station_info)
-    energie_froid_utile_kwh = float(cool_res["q_froid_utile_kwh_an"])
-    co2_factor_elec_kg_kwh = g_per_kwh_to_kg_per_kwh(CO2_FACTORS_G_PER_KWH["Électricité (réseau)"])
-    energie_label = None
-    rendement_actuel = None
-    co2_factor_actuel = None
-    if is_replacement:
-        energie_label = inputs.current_energy
-        rendement_actuel = float(inputs.current_efficiency)
-        co2_factor_actuel = g_per_kwh_to_kg_per_kwh(CO2_FACTORS_G_PER_KWH[energie_label])
-    om_pac_chf_per_year = annual_om_cost_chf("PAC géothermique", p_max_kw)
-    gshp = couts_annuels_gshp_zuberi(p_nom_kw=p_max_kw, chaleur_utile_kwh=besoin_total, prix_elec_chf_kwh=0.25, om_chf_per_year=om_pac_chf_per_year)
-    capex_brut, subvention_pac, capex_net = gshp_capex_net_after_subsidy(p_nom_kw=p_max_kw, canton=inputs.canton, project_type=inputs.project_type, current_energy_label=energie_label)
-    def load_price_pair(electricity_scenario: str, fuel_scenario: str) -> tuple[pd.Series, pd.Series | None]:
-        p_elec_local = load_price_path_electricity_ttc_by_canton(
-            SCEN_ELEC_CSV,
-            canton=inputs.canton,
-            building_type=building_type_price,
-            scenario=electricity_scenario,
+def render_payback_simulation_chart(
+    *,
+    unc: dict,
+    deterministic_payback: float | None,
+) -> None:
+    samples = unc.get("simulation_samples", {})
+    paybacks = samples.get("paybacks_extended", [])
+
+    if not paybacks:
+        st.info("Aucune simulation de temps de retour disponible pour le graphique.")
+        return
+
+    paybacks = [float(x) for x in paybacks if x is not None]
+
+    if not paybacks:
+        st.info("Aucune simulation amortie disponible pour le graphique.")
+        return
+
+    pb20 = unc.get("payback_p20")
+    pb50 = unc.get("payback_p50")
+    pb80 = unc.get("payback_p80")
+
+    prob_25 = unc.get("amortization_probability_life", unc.get("amortization_probability"))
+    prob_50 = unc.get("amortization_probability_extended")
+
+    fig, ax = plt.subplots(figsize=(9, 4.8))
+    bins = min(50, max(20, int(len(paybacks) ** 0.5)))
+    ax.hist(paybacks, bins=bins, edgecolor="black", alpha=0.75)
+
+    if deterministic_payback is not None:
+        ax.axvline(
+            float(deterministic_payback),
+            linestyle="--",
+            linewidth=2,
+            label=f"Cas général simplifié : {float(deterministic_payback):.1f} ans",
         )
-        p_elec_local = _clean_price_series(p_elec_local, name="electricite")
 
-        p_gas_local = load_price_path_fuel(SCEN_GAS_CSV, scenario=fuel_scenario)
-        p_oil_local = load_price_path_fuel(SCEN_OIL_CSV, scenario=fuel_scenario)
+    if pb50 is not None:
+        ax.axvline(
+            float(pb50),
+            linestyle="-",
+            linewidth=2,
+            label=f"Temps de retour médian : {float(pb50):.1f} ans",
+        )
 
-        if not is_replacement:
-            return p_elec_local, None
+    if pb20 is not None and pb80 is not None:
+        ax.axvspan(
+            float(pb20),
+            float(pb80),
+            alpha=0.18,
+            label=f"Intervalle central P20–P80 : {float(pb20):.1f}–{float(pb80):.1f} ans",
+        )
 
-        if energie_label == "Gaz naturel":
-            p_ref_local = _align_price_series_to_index(
-                p_gas_local,
-                p_elec_local.index,
-                name="gaz",
-            )
-        elif energie_label == "Mazout (fioul)":
-            p_ref_local = _align_price_series_to_index(
-                p_oil_local,
-                p_elec_local.index,
-                name="mazout",
-            )
+    ax.axvline(
+        25,
+        linestyle=":",
+        linewidth=2,
+        label="Horizon économique 25 ans",
+    )
+
+    ax.set_xlabel("Temps de retour actualisé simulé (années)")
+    ax.set_ylabel("Nombre de simulations amorties")
+    ax.set_title("Distribution des temps de retour simulés")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+
+    st.pyplot(fig)
+
+
+
+def render_npv_simulation_chart(
+    *,
+    unc: dict,
+    deterministic_npv: float | None,
+) -> None:
+    samples = unc.get("simulation_samples", {})
+    npvs = samples.get("npvs_life", [])
+
+    if not npvs:
+        st.info("Aucune simulation de VAN disponible pour le graphique.")
+        return
+
+    npvs = [float(x) for x in npvs if x is not None]
+
+    if not npvs:
+        st.info("Aucune simulation de VAN exploitable.")
+        return
+
+    npv_p10 = unc.get("npv_p10")
+    npv_p50 = unc.get("npv_p50")
+    npv_p90 = unc.get("npv_p90")
+
+    fig, ax = plt.subplots(figsize=(9, 4.8))
+
+    ax.hist(npvs, bins=35, edgecolor="black", alpha=0.75)
+
+    ax.axvline(
+        0,
+        linestyle=":",
+        linewidth=2,
+        label="Seuil de rentabilité VAN = 0",
+    )
+
+    if deterministic_npv is not None:
+        ax.axvline(
+            float(deterministic_npv),
+            linestyle="--",
+            linewidth=2,
+            label=f"Cas général simplifié : {format_chf(deterministic_npv, decimals=0)}",
+        )
+
+    if npv_p50 is not None:
+        ax.axvline(
+            float(npv_p50),
+            linestyle="-",
+            linewidth=2,
+            label=f"VAN médiane : {format_chf(npv_p50, decimals=0)}",
+        )
+
+    if npv_p10 is not None and npv_p90 is not None:
+        ax.axvspan(
+            float(npv_p10),
+            float(npv_p90),
+            alpha=0.18,
+            label="Intervalle P10–P90",
+        )
+
+    ax.set_xlabel("VAN simulée sur 25 ans (CHF)")
+    ax.set_ylabel("Nombre de simulations")
+    ax.set_title("Distribution de la VAN simulée")
+    ax.grid(True, alpha=0.25)
+    ax.legend()
+
+    st.pyplot(fig)
+
+
+# ============================================================
+# BLOCS D'AFFICHAGE DES RÉSULTATS
+# ============================================================
+
+def render_uncertainty_block(label: str, data: dict) -> None:
+    unc = data.get("uncertainty", {})
+
+    if not isinstance(unc, dict) or not unc.get("available"):
+        reason = unc.get("reason", "non_disponible") if isinstance(unc, dict) else "non_disponible"
+        st.info(f"Analyse d'incertitude non disponible pour ce scénario : {reason}.")
+        return
+
+    st.markdown("### Résultat de référence probabiliste — Monte Carlo")
+    st.caption(
+        "Les valeurs principales ci-dessous sont issues de la distribution Monte Carlo. "
+        "La médiane est utilisée comme valeur de référence, car elle intègre les incertitudes "
+        "sur les coûts, les besoins, les performances et les chocs de prix des énergies fossiles."
+    )
+
+    pb20 = unc.get("payback_p20")
+    pb50 = unc.get("payback_p50")
+    pb80 = unc.get("payback_p80")
+    representative = bool(unc.get("payback_median_representative", False))
+
+    prob_25 = unc.get("amortization_probability_life", unc.get("amortization_probability"))
+    prob_50 = unc.get("amortization_probability_extended")
+
+    c1, c2, c3 = st.columns(3)
+
+    if pb50 is not None:
+        if representative:
+            c1.metric("Temps de retour de référence", format_payback(pb50))
         else:
-            p_ref_local = p_elec_local.copy()
-
-        return p_elec_local, p_ref_local
-    om_systeme_actuel_chf_per_year = annual_om_cost_chf(energie_label, p_max_kw) if is_replacement and energie_label is not None else 0.0
-    def build_cost_and_emission_series(*, p_elec: pd.Series, p_actuel_heat: pd.Series | None, om_systeme_actuel_chf_per_year: float) -> dict[str, Any]:
-        p_elec = _clean_price_series(p_elec, name="electricite")
-        if p_actuel_heat is not None:
-            p_actuel_heat = _align_price_series_to_index(
-                p_actuel_heat,
-                p_elec.index,
-                name=str(energie_label or "systeme_actuel"),
-            )
-
-        cost_pac_heat_energy_series = (besoin_total / float(gshp.spf)) * p_elec
-        want_gshp_cooling = effective_cooling_mode != "no_cooling" and energie_froid_utile_kwh > 0
-        if want_gshp_cooling and cool_res["spf_froid"] is not None:
-            cost_pac_cool_series = float(cool_res["conso_elec_clim_kwh_an"]) * p_elec
-        else:
-            cost_pac_cool_series = pd.Series(0.0, index=p_elec.index)
-        om_pac_series = _constant_series_like(p_elec.index, gshp.om_chf_per_year)
-        cost_pac_total_series = cost_pac_heat_energy_series.add(cost_pac_cool_series, fill_value=0.0).add(om_pac_series, fill_value=0.0)
-        emissions_pac_series = pd.Series(float(gshp.conso_elec_kwh_per_year) * co2_factor_elec_kg_kwh + float(cool_res["conso_elec_clim_kwh_an"]) * co2_factor_elec_kg_kwh, index=p_elec.index)
-        cost_actuel_heat_energy_series = None
-        cost_actuel_cool_series = None
-        om_actuel_series = None
-        cost_actuel_total_series = None
-        emissions_actuel_series = None
-        emissions_clim_actuelle_kg = 0.0
-        if is_replacement:
-            if p_actuel_heat is None:
-                raise ValueError("Série de prix du système actuel absente.")
-            cost_actuel_heat_energy_series = (besoin_total / float(rendement_actuel)) * p_actuel_heat
-            if inputs.has_existing_ac and energie_froid_utile_kwh > 0 and inputs.eer_current_ac:
-                cost_actuel_cool_series = (energie_froid_utile_kwh / float(inputs.eer_current_ac)) * p_elec
-                emissions_clim_actuelle_kg = (energie_froid_utile_kwh / float(inputs.eer_current_ac)) * co2_factor_elec_kg_kwh
-            else:
-                cost_actuel_cool_series = pd.Series(0.0, index=p_elec.index)
-            om_actuel_series = _constant_series_like(p_elec.index, om_systeme_actuel_chf_per_year)
-            cost_actuel_total_series = cost_actuel_heat_energy_series.add(cost_actuel_cool_series, fill_value=0.0).add(om_actuel_series, fill_value=0.0)
-            conso_energie_actuelle_kwh = besoin_total / float(rendement_actuel)
-            emissions_actuel_series = pd.Series(conso_energie_actuelle_kwh * float(co2_factor_actuel) + emissions_clim_actuelle_kg, index=p_elec.index)
-        return {
-            "cost_pac_heat_energy_series": cost_pac_heat_energy_series,
-            "cost_pac_cool_series": cost_pac_cool_series,
-            "om_pac_series": om_pac_series,
-            "cost_pac_total_series": cost_pac_total_series,
-            "emissions_pac_series": emissions_pac_series,
-            "cost_actuel_heat_energy_series": cost_actuel_heat_energy_series,
-            "cost_actuel_cool_series": cost_actuel_cool_series,
-            "om_actuel_series": om_actuel_series,
-            "cost_actuel_total_series": cost_actuel_total_series,
-            "emissions_actuel_series": emissions_actuel_series,
-        }
-    scenario_results: dict[str, dict[str, Any]] = {}
-    price_sensitivity_results: dict[str, dict[str, Any]] = {}
-    parameter_sensitivity: list[dict[str, Any]] = []
-    p_elec_central, p_actuel_heat_central = load_price_pair(CENTRAL_SCENARIO["electricity"], CENTRAL_SCENARIO["fuel"])
-    central_series = build_cost_and_emission_series(p_elec=p_elec_central, p_actuel_heat=p_actuel_heat_central, om_systeme_actuel_chf_per_year=om_systeme_actuel_chf_per_year)
-    central_eco = compute_economic_indicators(cost_ref_series=central_series["cost_actuel_total_series"], cost_pac_series=central_series["cost_pac_total_series"], capex_net=capex_net, discount_rate=UNCERTAINTY_DISCOUNT_RATE)
-    central_payload = {
-        "label": "Central",
-        "electricity_scenario": CENTRAL_SCENARIO["electricity"],
-        "fuel_scenario": CENTRAL_SCENARIO["fuel"],
-        "years": list(p_elec_central.index),
-        **central_series,
-        "cout_pac_total_year0": central_eco["cout_pac_year0"],
-        "cout_actuel_total_year0": central_eco["cout_ref_year0"],
-        "economies_annuelles_year0": central_eco["economies_year0"],
-        "payback": central_eco["payback"],
-        "npv": central_eco["npv"],
-    }
-    if is_replacement and p_actuel_heat_central is not None:
-        central_payload["uncertainty"] = monte_carlo_project_uncertainty(inputs=inputs, froid={"cooling_mode_effective": effective_cooling_mode, **cool_res}, scenario_label="Central", p_elec=p_elec_central, p_actuel_heat=p_actuel_heat_central, besoin_chauffage_kwh=besoin_total, besoin_froid_utile_kwh=energie_froid_utile_kwh, capex_brut=capex_brut, subvention=subvention_pac, spf_heat=float(gshp.spf), spf_cool=cool_res["spf_froid"], om_pac_chf_per_year=float(gshp.om_chf_per_year), om_ref_chf_per_year=float(om_systeme_actuel_chf_per_year), current_efficiency=float(rendement_actuel), has_existing_ac=inputs.has_existing_ac, eer_current_ac=inputs.eer_current_ac, seed=42)
+            c1.metric("Temps de retour de référence conditionnel", format_payback(pb50))
     else:
-        central_payload["uncertainty"] = {"available": False, "reason": "pas_de_systeme_reference"}
-    scenario_results["Central"] = central_payload
-    if is_replacement and p_actuel_heat_central is not None:
-        parameter_sensitivity = compute_one_at_a_time_sensitivity(capex_net=capex_net, besoin_chauffage_kwh=besoin_total, energie_froid_utile_kwh=energie_froid_utile_kwh, p_elec=p_elec_central, p_actuel_heat=p_actuel_heat_central, spf_heat=float(gshp.spf), spf_cool=cool_res["spf_froid"], current_efficiency=float(rendement_actuel), has_existing_ac=inputs.has_existing_ac, eer_current_ac=inputs.eer_current_ac, om_pac_chf_per_year=float(gshp.om_chf_per_year), om_ref_chf_per_year=float(om_systeme_actuel_chf_per_year), discount_rate=UNCERTAINTY_DISCOUNT_RATE)
-    if is_replacement:
-        for label, cfg_price in PRICE_SENSITIVITY_SCENARIOS.items():
-            p_elec_s, p_ref_s = load_price_pair(cfg_price["electricity"], cfg_price["fuel"])
-            series_s = build_cost_and_emission_series(p_elec=p_elec_s, p_actuel_heat=p_ref_s, om_systeme_actuel_chf_per_year=om_systeme_actuel_chf_per_year)
-            eco_s = compute_economic_indicators(cost_ref_series=series_s["cost_actuel_total_series"], cost_pac_series=series_s["cost_pac_total_series"], capex_net=capex_net, discount_rate=UNCERTAINTY_DISCOUNT_RATE)
-            price_sensitivity_results[label] = {
-                "label": label,
-                "description": cfg_price["description"],
-                "electricity_scenario": cfg_price["electricity"],
-                "fuel_scenario": cfg_price["fuel"],
-                "cout_pac_total_year0": eco_s["cout_pac_year0"],
-                "cout_actuel_total_year0": eco_s["cout_ref_year0"],
-                "economies_annuelles_year0": eco_s["economies_year0"],
-                "payback": eco_s["payback"],
-                "npv": eco_s["npv"],
-            }
-    return {
-        "inputs": inputs,
-        "station_climatique": station_info,
-        "chauffage": res_ch,
-        "froid": {"cooling_hours": cooling_hours, "cooling_degree_hours": cooling_degree_hours, "cooling_mode_effective": effective_cooling_mode, **cool_res},
-        "pac": {
-            "p_nom_kw": p_max_kw,
-            "spf": float(gshp.spf),
-            "capex_brut": capex_brut,
-            "subvention": subvention_pac,
-            "capex_net": capex_net,
-            "cout_annuel_total_annee_0": central_payload["cout_pac_total_year0"],
-            "cout_fonctionnement_pac_premiere_annee": central_payload["cout_pac_total_year0"],
-            "om_annuel": float(gshp.om_chf_per_year),
-            "emissions_totales_kg": float(central_payload["emissions_pac_series"].iloc[0]) if central_payload.get("emissions_pac_series") is not None else None,
-        },
-        "confiance": compute_confidence_level(inputs=inputs, froid={"cooling_mode_effective": effective_cooling_mode, **cool_res}),
-        "scenarios": scenario_results,
-        "central": central_payload,
-        "price_sensitivity": price_sensitivity_results,
-        "parameter_sensitivity": parameter_sensitivity,
-    }
+        c1.metric("Temps de retour de référence", "—")
+
+    if pb20 is not None and pb80 is not None:
+        c2.metric("Intervalle central P20–P80", f"{float(pb20):.1f} – {float(pb80):.1f} ans")
+    else:
+        c2.metric("Intervalle central P20–P80", "—")
+
+    c3.metric("Probabilité amorti en 25 ans", format_percent(prob_25, decimals=0))
+
+    c4, c5, c6 = st.columns(3)
+
+    c4.metric("Probabilité amorti en 50 ans", format_percent(prob_50, decimals=0))
+    c5.metric("VAN de référence", format_chf(unc.get("npv_p50"), decimals=0))
+
+    if unc.get("npv_p10") is not None and unc.get("npv_p90") is not None:
+        c6.metric(
+            "VAN P10–P90",
+            f"{format_chf(unc.get('npv_p10'), decimals=0)} – {format_chf(unc.get('npv_p90'), decimals=0)}",
+        )
+    else:
+        c6.metric("VAN P10–P90", "—")
+
+    c7, c8, c9 = st.columns(3)
+    c7.metric("Économies année 1 médianes", format_chf(unc.get("annual_saving_year0_p50"), decimals=0))
+    c8.metric("CAPEX net médian simulé", format_chf(unc.get("capex_net_p50"), decimals=0))
+
+    n_life = unc.get("n_amortized_life", unc.get("n_amortized", 0))
+    n_extended = unc.get("n_amortized_extended", None)
+    n_sims = unc.get("n_sims", 0)
+
+    if n_extended is not None:
+        c9.metric("Simulations amorties", f"{n_life} / {n_sims} à 25 ans")
+        st.caption(f"Simulations amorties sur l'horizon étendu : {n_extended} / {n_sims}.")
+    else:
+        c9.metric("Simulations amorties", f"{n_life} / {n_sims}")
+
+    if pb50 is not None and not representative:
+        st.warning(
+            "Moins de 50 % des simulations sont amorties sur l'horizon étendu. "
+            "Le temps de retour médian affiché est donc conditionnel aux simulations amorties. "
+            "Dans ce cas, l'indicateur principal à regarder est la probabilité d'amortissement."
+        )
+
+    st.markdown("### Distribution des simulations")
+    st.caption(
+        "La ligne pleine indique la médiane Monte Carlo, utilisée comme référence. "
+        "La ligne pointillée indique le résultat déterministe sans chocs fossiles, conservé uniquement comme comparaison."
+    )
+    render_payback_simulation_chart(
+        unc=unc,
+        deterministic_payback=data.get("payback"),
+    )
+    render_npv_simulation_chart(
+        unc=unc,
+        deterministic_npv=data.get("npv"),
+    )
+
+    confidence = unc.get("confidence", {})
+    if isinstance(confidence, dict) and confidence:
+        level = confidence.get("level")
+        score = confidence.get("score")
+        reasons_positive = confidence.get("reasons_positive", [])
+        reasons_negative = confidence.get("reasons_negative", [])
+
+        with st.expander("Niveau de confiance du résultat"):
+            st.write(f"**Niveau :** {level} — score {score}")
+
+            if reasons_positive:
+                st.write("Points favorables :")
+                for reason in reasons_positive:
+                    st.write(f"- {reason}")
+
+            if reasons_negative:
+                st.write("Points de prudence :")
+                for reason in reasons_negative:
+                    st.write(f"- {reason}")
+
+    with st.expander("Détail de l'analyse d'incertitude"):
+        st.write({
+            "scénario": label,
+            "méthode": unc.get("method"),
+            "nombre_simulations": unc.get("n_sims"),
+            "horizon_economique_ans": unc.get("horizon_years"),
+            "horizon_payback_etendu_ans": unc.get("payback_max_years"),
+            "taux_actualisation": unc.get("discount_rate"),
+            "temps_retour_p20_conditionnel": unc.get("payback_p20"),
+            "temps_retour_p50_conditionnel": unc.get("payback_p50"),
+            "temps_retour_p80_conditionnel": unc.get("payback_p80"),
+            "temps_retour_median_representatif": unc.get("payback_median_representative"),
+            "probabilite_amortissement_25_ans": unc.get("amortization_probability_life"),
+            "probabilite_amortissement_50_ans": unc.get("amortization_probability_extended"),
+            "van_p10": unc.get("npv_p10"),
+            "van_p50": unc.get("npv_p50"),
+            "van_p90": unc.get("npv_p90"),
+            "hypotheses": unc.get("assumptions"),
+        })
+
+
+def build_parameter_sensitivity_display(rows: list[dict]) -> pd.DataFrame:
+    display_rows = []
+
+    for row in rows:
+        display_rows.append({
+            "Paramètre": row.get("parametre"),
+            "Variation basse": row.get("variation_basse"),
+            "Retour bas": format_table_float(row.get("payback_bas"), 1),
+            "VAN basse": format_table_float(row.get("npv_bas"), 0),
+            "Central": "central",
+            "Retour central": format_table_float(row.get("payback_central"), 1),
+            "VAN centrale": format_table_float(row.get("npv_central"), 0),
+            "Variation haute": row.get("variation_haute"),
+            "Retour haut": format_table_float(row.get("payback_haut"), 1),
+            "VAN haute": format_table_float(row.get("npv_haut"), 0),
+            "Impact VAN max": format_table_float(row.get("impact_npv_abs"), 0),
+        })
+
+    return pd.DataFrame(display_rows)
+
+
+def build_price_sensitivity_display(price_sensitivity: dict) -> pd.DataFrame:
+    rows = []
+
+    for label, data in price_sensitivity.items():
+        rows.append({
+            "Scénario prix": label,
+            "Description": data.get("description"),
+            "Électricité": data.get("electricity_scenario"),
+            "Énergie actuelle": data.get("fuel_scenario"),
+            "Coût actuel année 1": format_table_float(data.get("cout_actuel_total_year0"), 0),
+            "Coût PAC année 1": format_table_float(data.get("cout_pac_total_year0"), 0),
+            "Économies année 1": format_table_float(data.get("economies_annuelles_year0"), 0),
+            "Temps retour": format_table_float(data.get("payback"), 1),
+            "VAN": format_table_float(data.get("npv"), 0),
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# FORMULAIRE
+# ============================================================
+
+def build_inputs_from_form() -> ProjectInputs:
+    st.sidebar.header("Paramètres du projet")
+
+    project_type_label = st.sidebar.radio(
+        "Type de projet",
+        options=["Remplacement ancien chauffage", "Nouveau bâtiment"],
+    )
+    project_type = "replacement" if project_type_label == "Remplacement ancien chauffage" else "new_building"
+
+    if project_type == "replacement":
+        st.write(
+            "Cet outil permet de déterminer la rentabilité de l'installation d'une pompe "
+            "à chaleur géothermique par rapport à votre système de chauffage actuel. "
+            "Il prend en compte au mieux les caractéristiques de votre bâtiment et propose "
+            "une aide à la décision, mais il ne remplace pas un devis détaillé réalisé par "
+            "des professionnels."
+        )
+    else:
+        st.write(
+            "Cette section permet de déterminer la rentabilité de l'installation d'une pompe "
+            "à chaleur géothermique pour un nouveau bâtiment. Il propose une aide à la décision "
+            "rapide, mais ne remplace pas un devis détaillé réalisé par des professionnels."
+        )
+
+    postcode_valid = False
+    postcode_meta = None
+    canton = "Vaud"  # fallback interne, mais le calcul sera bloqué si postcode_valid = False
+
+    # ========================================================
+    # BÂTIMENT
+    # ========================================================
+
+    st.header("1. Caractéristiques du bâtiment")
+
+    # Le code postal est placé dans le corps principal de l'application,
+    # car c'est une information centrale pour l'utilisateur : il détermine
+    # automatiquement le canton et la station climatique utilisée.
+    postcode = st.text_input("Code postal du bâtiment", value="1000")
+
+    if postcode.strip():
+        try:
+            postcode_meta = postcode_info(postcode)
+            canton = postcode_meta["canton_name"]
+            postcode_valid = True
+
+            st.success(
+                f"Localisation reconnue : {postcode_meta['locality']} — "
+                f"{postcode_meta['canton_abbr']} "
+                f"({postcode_meta['canton_name']})"
+            )
+
+        except ValueError as e:
+            st.error(str(e))
+            postcode_valid = False
+
+        except Exception as e:
+            st.error(
+                "Erreur lors de la lecture de la base des codes postaux. "
+                f"Détail : {e}"
+            )
+            postcode_valid = False
+    else:
+        st.error("Code postal invalide. Veuillez vérifier votre saisie.")
+        postcode_valid = False
+
+    st.session_state["postcode_valid"] = postcode_valid
+    st.session_state["postcode_meta"] = postcode_meta
+
+    building_type_label = st.selectbox(
+        "Typologie du bâtiment",
+        options=[label for _, label in TYPOLOGIES_MENU],
+    )
+    building_type_key = next(key for key, label in TYPOLOGIES_MENU if label == building_type_label)
+
+    date_construction_label = st.selectbox(
+        "Date de construction",
+        options=DATE_CONSTRUCTION_CHOICES,
+        index=2,
+    )
+    st.caption(
+        "Si l'isolation du bâtiment a été rénovée, prenez la date de ces travaux "
+        "plutôt que la date de construction initiale."
+    )
+    ubat = float(DATE_CONSTRUCTION_UBAT[date_construction_label])
+
+    # Le mémoire retient une valeur standard fixe R = 0.20 W/m³K.
+    # On supprime donc le choix utilisateur de la ventilation et son affichage.
+    ventilation_r = DEFAULT_VENTILATION_R
+
+    # ========================================================
+    # GÉOMÉTRIE
+    # ========================================================
+
+    st.header("2. Géométrie et données thermiques")
+    st.write(
+        "Cette section permet de déterminer la surface de déperdition du bâtiment "
+        "ainsi que le volume habitable. La surface de déperdition représente "
+        "l'ensemble des parois en contact avec l'extérieur. Plusieurs méthodes "
+        "de saisie sont disponibles, en fonction de vos connaissances des "
+        "paramètres du bâtiment."
+    )
+
+    sdep_mode = st.radio(
+        "Méthode de saisie de la géométrie du bâtiment",
+        options=["Estimation par typologie", "Estimation par périmètre", "Saisie directe"],
+        horizontal=True,
+    )
+
+    sdep_m2 = None
+    vh_m3 = None
+    shab_m2 = None
+    niveaux = None
+    perimetre_m = None
+    hauteur_m = DEFAULT_CEILING_HEIGHT_M
+    toiture_exposee = True
+    plancher_expose = True
+    forme_generale = None
+    mitoyennete = None
+    longueur_m = None
+    largeur_m = None
+
+    if sdep_mode == "Estimation par typologie":
+        defaults = DEFAULT_GEOMETRY_BY_BUILDING_TYPE[building_type_key]
+
+        st.caption(
+            "Méthode la plus générale, à privilégier si vous ne connaissez pas "
+            "les paramètres techniques du bâtiment."
+        )
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            shab_m2 = st.number_input(
+                "Surface habitable (m²)",
+                min_value=1.0,
+                value=180.0,
+                step=10.0,
+            )
+
+        with c2:
+            niveaux = st.number_input(
+                "Niveaux chauffés",
+                min_value=1,
+                max_value=20,
+                value=2,
+                step=1,
+            )
+
+        with c3:
+            hauteur_m = st.number_input(
+                "Hauteur sous plafond (m)",
+                min_value=1.8,
+                value=float(defaults["hauteur_m"]),
+                step=0.1,
+            )
+
+        c4, c5, c6 = st.columns(3)
+
+        with c4:
+            mitoyennete = st.selectbox(
+                "Mitoyenneté",
+                options=["isole", "1_cote", "2_cotes", "3_cotes"],
+                index=["isole", "1_cote", "2_cotes", "3_cotes"].index(
+                    defaults["mitoyennete"]
+                ),
+                format_func=lambda x: MITOYENNETE_LABELS[x],
+            )
+
+        with c5:
+            toiture_exposee = st.checkbox(
+                "Toiture en contact avec l'extérieur",
+                value=bool(defaults["toiture_exposee"]),
+            )
+
+        with c6:
+            plancher_expose = st.checkbox(
+                "Plancher bas sur extérieur / volume non chauffé",
+                value=bool(defaults["plancher_expose"]),
+            )
+
+        sdep_est, vh_est, geo_meta = estimate_sdep_vh_typology_with_exposure(
+            shab_m2=float(shab_m2),
+            niveaux=int(niveaux),
+            hauteur_m=float(hauteur_m),
+            building_type_key=building_type_key,
+            mitoyennete=mitoyennete,
+            toiture_exposee=bool(toiture_exposee),
+            plancher_expose=bool(plancher_expose),
+        )
+
+        st.caption(
+            "Voici les paramètres estimés de votre bâtiment. Vous pouvez les "
+            "modifier si vous disposez de données plus précises."
+        )
+
+        c7, c8 = st.columns(2)
+
+        with c7:
+            sdep_m2 = st.number_input(
+                "Surface de déperdition estimée (m²)",
+                min_value=1.0,
+                value=float(sdep_est),
+                step=10.0,
+            )
+
+        with c8:
+            vh_m3 = st.number_input(
+                "Volume habitable (m³)",
+                min_value=1.0,
+                value=float(vh_est),
+                step=10.0,
+            )
+
+    elif sdep_mode == "Estimation par périmètre":
+        st.caption(
+            "Méthode intermédiaire si vous connaissez le périmètre extérieur du bâtiment."
+        )
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        with c1:
+            shab_m2 = st.number_input(
+                "Surface habitable (m²)",
+                min_value=1.0,
+                value=180.0,
+                step=10.0,
+            )
+
+        with c2:
+            niveaux = st.number_input(
+                "Niveaux chauffés",
+                min_value=1,
+                max_value=20,
+                value=2,
+                step=1,
+            )
+
+        with c3:
+            perimetre_m = st.number_input(
+                "Périmètre extérieur (m)",
+                min_value=1.0,
+                value=40.0,
+                step=1.0,
+            )
+
+        with c4:
+            hauteur_m = st.number_input(
+                "Hauteur sous plafond (m)",
+                min_value=1.8,
+                value=2.5,
+                step=0.1,
+            )
+
+        toiture_exposee = st.checkbox(
+            "Toiture en contact avec l'extérieur",
+            value=True,
+        )
+
+        plancher_expose = st.checkbox(
+            "Plancher bas sur extérieur / volume non chauffé",
+            value=True,
+        )
+
+        sdep_est, vh_est = estimate_sdep_vh_from_perimeter(
+            shab_m2,
+            int(niveaux),
+            perimetre_m,
+            hauteur_m,
+            toiture_exposee,
+            plancher_expose,
+        )
+
+        st.caption(
+            "Voici les paramètres estimés de votre bâtiment. Vous pouvez les "
+            "modifier si vous disposez de données plus précises."
+        )
+
+        c5, c6 = st.columns(2)
+
+        with c5:
+            sdep_m2 = st.number_input(
+                "Surface de déperdition estimée (m²)",
+                min_value=1.0,
+                value=float(sdep_est),
+                step=10.0,
+            )
+
+        with c6:
+            vh_m3 = st.number_input(
+                "Volume habitable (m³)",
+                min_value=1.0,
+                value=float(vh_est),
+                step=10.0,
+            )
+
+    else:
+        st.caption(
+            "Méthode la plus précise si vous connaissez les paramètres techniques du bâtiment."
+        )
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            sdep_m2 = st.number_input(
+                "Surface de déperdition (m²)",
+                min_value=1.0,
+                value=350.0,
+                step=10.0,
+            )
+
+        with c2:
+            vh_m3 = st.number_input(
+                "Volume habitable (m³)",
+                min_value=1.0,
+                value=600.0,
+                step=10.0,
+            )
+
+    # ========================================================
+    # SYSTÈME ACTUEL
+    # ========================================================
+
+    current_energy = None
+    current_efficiency = None
+    has_existing_ac = False
+    eer_current_ac = None
+
+    if project_type == "replacement":
+        st.header("3. Système actuel")
+        st.write(
+            "Cette section concerne les paramètres de votre système de chauffage "
+            "actuellement installé."
+        )
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            current_energy = st.selectbox(
+                "Énergie du système actuel",
+                options=list(ENERGY_CHOICES.keys()),
+            )
+
+        with c2:
+            current_efficiency = st.number_input(
+                "Rendement actuel",
+                min_value=0.1,
+                max_value=1.2,
+                value=float(RENDEMENTS_STANDARDS[current_energy]),
+                step=0.01,
+            )
+            st.caption(
+                "Si vous ne connaissez pas le rendement de votre système de chauffage, "
+                "veuillez laisser la valeur associée par défaut."
+            )
+
+        has_existing_ac = st.checkbox(
+            "Le bâtiment a déjà une climatisation",
+            value=False,
+        )
+
+        if has_existing_ac:
+            eer_current_ac = st.number_input(
+                "Rendement de la clim actuelle",
+                min_value=0.5,
+                value=EER_CLIM_ACTUEL_DEFAULT,
+                step=0.1,
+            )
+
+    # ========================================================
+    # RAFRAÎCHISSEMENT
+    # ========================================================
+
+    cooling_section_number = 4 if project_type == "replacement" else 3
+    st.header(f"{cooling_section_number}. Rafraîchissement")
+    st.write(
+        "Cette section est consacrée à l'utilisation de la pompe à chaleur pour la climatisation."
+    )
+
+    want_cooling = st.checkbox(
+        "Je souhaite utiliser la pompe à chaleur en mode climatisation",
+        value=True,
+    )
+
+    surface_climatisee_m2 = 0.0
+    cooling_mode = "no_cooling"
+    vitrage_level = "moyen"
+    solar_protection_level = "moyenne"
+    usage_level = "normal"
+    night_ventilation = False
+
+    if want_cooling:
+        cooling_mode_descriptions = {
+            "no_cooling": "Aucun besoin de climatisation n'est ajouté au calcul.",
+            "free_cooling": "La fraîcheur du sol est utilisée au maximum, avec une consommation électrique très limitée.",
+            "hybrid": "Le système combine le refroidissement passif et un appoint actif lorsque les besoins sont plus importants.",
+            "active_cooling": "La pompe à chaleur fonctionne activement en mode climatisation, avec une consommation électrique plus élevée.",
+        }
+
+        vitrage_descriptions = {
+            "faible": "Peu de surfaces vitrées : les apports solaires restent limités.",
+            "moyen": "Surface vitrée standard pour ce type de bâtiment.",
+            "fort": "Grandes surfaces vitrées : les apports solaires peuvent augmenter les besoins de climatisation.",
+        }
+
+        solar_descriptions = {
+            "bonne": "Protections efficaces, par exemple stores extérieurs, volets ou brise-soleil.",
+            "moyenne": "Protections partielles ou utilisées de manière irrégulière.",
+            "faible": "Peu ou pas de protections solaires efficaces.",
+        }
+
+        usage_descriptions = {
+            "faible": "Occupation limitée et peu d'appareils produisant de la chaleur.",
+            "normal": "Usage standard du bâtiment.",
+            "eleve": "Occupation importante ou nombreux apports internes, par exemple équipements, éclairage ou informatique.",
+        }
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            default_surface = shab_m2 if shab_m2 is not None else 100.0
+
+            surface_climatisee_m2 = st.number_input(
+                "Surface climatisée (m²)",
+                min_value=0.0,
+                value=float(default_surface),
+                step=10.0,
+            )
+
+        with c2:
+            cooling_mode = st.selectbox(
+                "Mode de refroidissement",
+                options=["no_cooling", "free_cooling", "hybrid", "active_cooling"],
+                format_func=lambda x: {
+                    "no_cooling": "Pas de climatisation",
+                    "free_cooling": "Free cooling / passif",
+                    "hybrid": "Hybride",
+                    "active_cooling": "Refroidissement actif",
+                }[x],
+            )
+            st.caption(cooling_mode_descriptions[cooling_mode])
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            vitrage_level = st.selectbox(
+                "Surface vitrée",
+                ["faible", "moyen", "fort"],
+            )
+            st.caption(vitrage_descriptions[vitrage_level])
+
+        with c2:
+            solar_protection_level = st.selectbox(
+                "Protections solaires",
+                ["bonne", "moyenne", "faible"],
+            )
+            st.caption(solar_descriptions[solar_protection_level])
+
+        with c3:
+            usage_level = st.selectbox(
+                "Occupation / apports",
+                ["faible", "normal", "eleve"],
+            )
+            st.caption(usage_descriptions[usage_level])
+
+        night_ventilation = st.checkbox(
+            "Ventilation nocturne possible",
+            value=False,
+        )
+
+    # ========================================================
+    # OBJET FINAL
+    # ========================================================
+
+    return ProjectInputs(
+        project_type=project_type,
+        canton=canton,
+        postcode=postcode,
+        building_type_key=building_type_key,
+        ubat=ubat,
+        ventilation_r=ventilation_r,
+        sdep_mode=sdep_mode,
+        sdep_m2=sdep_m2,
+        vh_m3=vh_m3,
+        shab_m2=shab_m2,
+        niveaux=int(niveaux) if niveaux is not None else None,
+        perimetre_m=perimetre_m,
+        hauteur_m=hauteur_m,
+        toiture_exposee=toiture_exposee,
+        plancher_expose=plancher_expose,
+        forme_generale=forme_generale,
+        mitoyennete=mitoyennete,
+        longueur_m=longueur_m,
+        largeur_m=largeur_m,
+        current_energy=current_energy,
+        current_efficiency=current_efficiency,
+        want_cooling=want_cooling,
+        surface_climatisee_m2=surface_climatisee_m2,
+        cooling_mode=cooling_mode,
+        vitrage_level=vitrage_level,
+        solar_protection_level=solar_protection_level,
+        usage_level=usage_level,
+        night_ventilation=night_ventilation,
+        has_existing_ac=has_existing_ac,
+        eer_current_ac=eer_current_ac,
+    )
+
+
+
+def render_deterministic_comparison_block(central: dict) -> None:
+    """Affiche le scénario déterministe comme comparaison secondaire."""
+    st.subheader("Comparaison : scénario déterministe sans chocs fossiles")
+    st.caption(
+        "Ce scénario utilise les trajectoires centrales de prix et ne simule pas les chocs "
+        "historiques liés au gaz ou au mazout. Il sert de point de comparaison, mais la "
+        "valeur de référence pour la décision est la médiane Monte Carlo affichée plus haut."
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Coût actuel année 1", format_chf(central.get("cout_actuel_total_year0"), decimals=0))
+    c2.metric("Coût PAC année 1", format_chf(central.get("cout_pac_total_year0"), decimals=0))
+    c3.metric("Économies année 1", format_chf(central.get("economies_annuelles_year0"), decimals=0))
+    c4.metric("Temps de retour déterministe", format_payback(central.get("payback")))
+
+    c5, c6 = st.columns(2)
+    c5.metric("VAN déterministe", format_chf(central.get("npv"), decimals=0))
+    c6.metric(
+        "Hypothèse prix déterministe",
+        f"Élec. {central.get('electricity_scenario', 'neutral')} / "
+        f"référence {central.get('fuel_scenario', 'neutral')}",
+    )
+
+
+
+def safe_series_sum(value: object) -> float | None:
+    """Somme une série ou une liste numérique en évitant de casser l'interface."""
+    try:
+        s = pd.Series(value).astype(float)
+        if s.empty:
+            return None
+        return float(s.sum())
+    except Exception:
+        return None
+
+
+def compute_co2_reduction_percent(central: dict) -> float | None:
+    """Calcule la réduction cumulée d'émissions de CO₂ du cas PAC par rapport au système actuel."""
+    emissions_actuel = central.get("emissions_actuel_series")
+    emissions_pac = central.get("emissions_pac_series")
+
+    total_actuel = safe_series_sum(emissions_actuel)
+    total_pac = safe_series_sum(emissions_pac)
+
+    if total_actuel is None or total_pac is None or total_actuel <= 0:
+        return None
+
+    return 100.0 * (total_actuel - total_pac) / total_actuel
+
+
+def render_public_simulation_block(label: str, data: dict) -> None:
+    """Affiche l'analyse avec incertitudes dans un langage plus accessible."""
+    unc = data.get("uncertainty", {})
+
+    if not isinstance(unc, dict) or not unc.get("available"):
+        reason = unc.get("reason", "non_disponible") if isinstance(unc, dict) else "non_disponible"
+        st.info(
+            "Le calcul avec variations possibles n'est pas disponible pour ce cas. "
+            f"Détail : {reason}."
+        )
+        return
+
+    st.subheader("Résultats avec variations possibles")
+    st.write(
+        "Dans cette partie, l'outil refait le calcul un grand nombre de fois en faisant varier "
+        "raisonnablement les paramètres incertains. De plus, cette partie tient notamment compte "
+        "de possibles hausses fortes du gaz ou du mazout, qui ne sont pas incluses dans le "
+        "récapitulatif présenté plus haut."
+    )
+
+    pb50 = unc.get("payback_p50")
+    prob_25 = unc.get("amortization_probability_life", unc.get("amortization_probability"))
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Temps de retour médian", format_payback(pb50))
+    c2.metric("Chance d'être rentabilisé en 25 ans", format_percent(prob_25, decimals=0))
+    c3.metric("VAN médiane", format_chf(unc.get("npv_p50"), decimals=0))
+
+    if pb50 is not None and not bool(unc.get("payback_median_representative", False)):
+        st.warning(
+            "Dans beaucoup de calculs, l'installation n'est pas rentabilisée dans la période étudiée. "
+            "Le temps de retour affiché doit donc être lu avec prudence : regardez surtout la chance "
+            "d'être rentabilisé."
+        )
+
+    with st.expander("Voir les graphiques des variations possibles"):
+        st.caption(
+            "Ces graphiques montrent la dispersion des résultats obtenus lorsque les hypothèses varient."
+        )
+        render_payback_simulation_chart(
+            unc=unc,
+            deterministic_payback=data.get("payback"),
+        )
+        render_npv_simulation_chart(
+            unc=unc,
+            deterministic_npv=data.get("npv"),
+        )
+
+# ============================================================
+# RÉSULTATS
+# ============================================================
+
+def render_results(results: dict) -> None:
+    chauffage = results["chauffage"]
+    froid = results["froid"]
+    pac = results["pac"]
+    inputs = results["inputs"]
+    station = results["station_climatique"]
+
+    central = results.get("central")
+    scenarios = results.get("scenarios", {})
+    if central is None and "Central" in scenarios:
+        central = scenarios["Central"]
+
+    results_section_number = 5 if inputs.project_type == "replacement" else 4
+    st.header(f"{results_section_number}. Résultats")
+
+    # ========================================================
+    # RÉCAPITULATIF RAPIDE
+    # ========================================================
+
+    st.subheader("Récapitulatif rapide")
+    st.write(
+        "Voici les principaux ordres de grandeur estimés pour votre bâtiment et pour "
+        "l'installation d'une pompe à chaleur géothermique."
+    )
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric(
+        "Puissance estimée de la pompe à chaleur",
+        f"{chauffage['p_pointe_kw']:.1f} kW",
+    )
+    c2.metric(
+        "Besoin annuel de chauffage",
+        f"{chauffage['energie_annuelle_kwh']:.0f} kWh/an",
+    )
+    c3.metric(
+        "Besoin annuel de climatisation",
+        f"{froid['q_froid_utile_kwh_an']:.0f} kWh/an",
+    )
+
+    if inputs.project_type != "replacement":
+        c4, c5 = st.columns(2)
+        c4.metric(
+            "CAPEX estimé",
+            format_chf(pac["capex_brut"], decimals=0),
+            help=(
+                "Le CAPEX représente l'investissement initial estimé, comprenant "
+                "le prix de la pompe à chaleur et de son installation."
+            ),
+        )
+        pac_first_year_cost = pac.get(
+            "cout_fonctionnement_pac_premiere_annee"
+        )
+
+        # Compatibilité avec les anciennes versions du moteur de calcul.
+        if pac_first_year_cost is None:
+            pac_first_year_cost = pac.get("cout_annuel_total_annee_0")
+
+        if pac_first_year_cost is None and central is not None:
+            pac_first_year_cost = central.get("cout_pac_total_year0")
+
+        if pac_first_year_cost is None and central is not None:
+            pac_cost_series = central.get("cost_pac_total_series")
+            try:
+                if pac_cost_series is not None and len(pac_cost_series) > 0:
+                    pac_first_year_cost = float(pd.Series(pac_cost_series).iloc[0])
+            except Exception:
+                pac_first_year_cost = None
+
+        c5.metric(
+            "Coût de fonctionnement de la PAC pour la première année",
+            format_chf(pac_first_year_cost, decimals=0),
+            help=(
+                "Coût estimé de l'électricité et de la maintenance de la pompe à chaleur "
+                "pendant la première année."
+            ),
+        )
+        return
+
+    c4, c5, c6 = st.columns(3)
+    c4.metric(
+        "CAPEX brut estimé",
+        format_chf(pac["capex_brut"], decimals=0),
+        help=(
+            "Le CAPEX représente l'investissement initial total, comprenant "
+            "le prix de la pompe et de son installation, avant déduction des subventions."
+        ),
+    )
+    c5.metric(
+        "Subventions estimées",
+        format_chf(pac["subvention"], decimals=0),
+        help="Aides financières estimées selon le canton et le type de projet.",
+    )
+    c6.metric(
+        "CAPEX net estimé",
+        format_chf(pac["capex_net"], decimals=0),
+        help="Coût de l'investissement initial estimé après déduction des subventions.",
+    )
+
+    if central is None:
+        st.error("Résultat central introuvable. Vérifie que calcul_projet.py retourne bien la clé 'central'.")
+        return
+
+    # ========================================================
+    # CAS SIMPLE / DÉTERMINISTE
+    # ========================================================
+
+    st.subheader("Résultat avec les hypothèses principales")
+    st.write(
+        "Ce premier résultat compare la pompe à chaleur géothermique avec votre système actuel "
+        "en utilisant les hypothèses principales de prix et de performance."
+    )
+    st.warning(
+        "Ce cas ne prend pas en compte les fortes hausses possibles du gaz ou du mazout. "
+        "Ces variations sont étudiées dans la partie suivante."
+    )
+
+    d1, d2, d3 = st.columns(3)
+    d1.metric(
+        "Temps de retour estimé",
+        format_payback(central.get("payback")),
+        help="Durée nécessaire pour que les économies réalisées compensent le coût d'installation.",
+    )
+    d2.metric(
+        "VAN estimée",
+        format_chf(central.get("npv"), decimals=0),
+        help="Bilan économique global sur la durée étudiée, en tenant compte du coût d'installation et des économies futures.",
+    )
+    d3.metric(
+        "Économies estimées la première année",
+        format_chf(central.get("economies_annuelles_year0"), decimals=0),
+        help="Différence estimée entre le coût annuel du système actuel et celui de la pompe à chaleur.",
+    )
+
+    st.markdown("#### Coûts cumulés dans le temps")
+    st.write(
+        "Le graphique ci-dessous compare le coût cumulé du système actuel avec celui de la pompe "
+        "à chaleur. Vous pouvez tester rapidement l'effet d'une hausse ou d'une baisse des prix."
+    )
+
+    if "interactive_adjustments" not in st.session_state:
+        st.session_state["interactive_adjustments"] = default_interactive_adjustments()
+
+    adjustments = st.session_state["interactive_adjustments"]
+    if "electricity_price_pct" not in adjustments:
+        adjustments["electricity_price_pct"] = int(adjustments.get("pac_annual_pct", 0))
+    adjustments.pop("pac_annual_pct", None)
+
+    interactive_metrics = render_interactive_cumulative_cost_chart(
+        central=central,
+        pac=pac,
+        adjustments=adjustments,
+    )
+    render_interactive_adjustment_controls(results)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Temps de retour recalculé", format_payback(interactive_metrics.get("payback")))
+    m2.metric("VAN recalculée", format_chf(interactive_metrics.get("van_recalculee"), decimals=0))
+    m3.metric("CAPEX recalculé", format_chf(interactive_metrics.get("capex_net"), decimals=0))
+
+    st.markdown("#### Réduction estimée des émissions de CO₂")
+    st.write(
+        "Une pompe à chaleur géothermique permet de réduire grandement les émissions de CO2, "
+        "ce graphique représente la réduction estimée des émissions. Il ne prend pas en compte "
+        "les émissions liées à la fabrication et au transport du système de chauffage, seulement "
+        "les émissions liées au fonctionnement."
+    )
+
+    if central.get("emissions_actuel_series") is not None and central.get("emissions_pac_series") is not None:
+        fig_co2 = build_cumulative_emissions_bar_chart(
+            central["emissions_actuel_series"],
+            central["emissions_pac_series"],
+            "Cas principal",
+        )
+        st.pyplot(fig_co2)
+
+        co2_reduction = compute_co2_reduction_percent(central)
+        if co2_reduction is not None:
+            st.success(
+                f"Réduction cumulée estimée des émissions : **{co2_reduction:.0f} %** "
+                "par rapport au système actuel."
+            )
+        else:
+            st.caption("La réduction des émissions n'a pas pu être calculée automatiquement.")
+    else:
+        st.info("Les séries d'émissions ne sont pas disponibles pour ce scénario.")
+
+    # ========================================================
+    # RÉSULTATS AVEC VARIATIONS POSSIBLES
+    # ========================================================
+
+    render_public_simulation_block("Central", central)
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def init_session_state() -> None:
+    if "results" not in st.session_state:
+        st.session_state["results"] = None
+
+    if "interactive_adjustments" not in st.session_state:
+        st.session_state["interactive_adjustments"] = default_interactive_adjustments()
+
+
+def main() -> None:
+    st.title("Rentabilité d'une PAC géothermique en Suisse")
+
+    init_session_state()
+
+    try:
+        inputs = build_inputs_from_form()
+
+        if st.button("Lancer le calcul", type="primary"):
+            if not st.session_state.get("postcode_valid", False):
+                st.error("Le calcul ne peut pas être lancé tant que le code postal n'est pas valide.")
+            else:
+                st.session_state["results"] = evaluer_projet(inputs)
+                reset_interactive_adjustments()
+
+        if st.session_state["results"] is not None:
+            render_results(st.session_state["results"])
+
+    except Exception as e:
+        st.error(f"Erreur : {e}")
+        st.info(
+            "Vérifie en priorité : le code postal, le canton, les fichiers CSV de scénarios, "
+            "les données climatiques, le fichier de calibration du froid et l'installation de Plotly."
+        )
+        with st.expander("Détail technique de l'erreur"):
+            st.exception(e)
+
+
+if __name__ == "__main__":
+    main()
