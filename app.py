@@ -1022,6 +1022,21 @@ def build_inputs_from_form() -> ProjectInputs:
     )
     project_type = "replacement" if project_type_label == "Remplacement ancien chauffage" else "new_building"
 
+    if project_type == "replacement":
+        st.write(
+            "Cet outil permet de déterminer la rentabilité de l'installation d'une pompe "
+            "à chaleur géothermique par rapport à votre système de chauffage actuel. "
+            "Il prend en compte au mieux les caractéristiques de votre bâtiment et propose "
+            "une aide à la décision, mais il ne remplace pas un devis détaillé réalisé par "
+            "des professionnels."
+        )
+    else:
+        st.write(
+            "Cette section permet de déterminer la rentabilité de l'installation d'une pompe "
+            "à chaleur géothermique pour un nouveau bâtiment. Il propose une aide à la décision "
+            "rapide, mais ne remplace pas un devis détaillé réalisé par des professionnels."
+        )
+
     postcode_valid = False
     postcode_meta = None
     canton = "Vaud"  # fallback interne, mais le calcul sera bloqué si postcode_valid = False
@@ -1370,7 +1385,8 @@ def build_inputs_from_form() -> ProjectInputs:
     # RAFRAÎCHISSEMENT
     # ========================================================
 
-    st.header("4. Rafraîchissement")
+    cooling_section_number = 4 if project_type == "replacement" else 3
+    st.header(f"{cooling_section_number}. Rafraîchissement")
     st.write(
         "Cette section est consacrée à l'utilisation de la pompe à chaleur pour la climatisation."
     )
@@ -1619,7 +1635,8 @@ def render_results(results: dict) -> None:
     if central is None and "Central" in scenarios:
         central = scenarios["Central"]
 
-    st.header("5. Résultats")
+    results_section_number = 5 if inputs.project_type == "replacement" else 4
+    st.header(f"{results_section_number}. Résultats")
 
     # ========================================================
     # RÉCAPITULATIF RAPIDE
@@ -1645,6 +1662,29 @@ def render_results(results: dict) -> None:
         f"{froid['q_froid_utile_kwh_an']:.0f} kWh/an",
     )
 
+    if inputs.project_type != "replacement":
+        c4, c5 = st.columns(2)
+        c4.metric(
+            "CAPEX estimé",
+            format_chf(pac["capex_brut"], decimals=0),
+            help=(
+                "Le CAPEX représente l'investissement initial estimé, comprenant "
+                "le prix de la pompe à chaleur et de son installation."
+            ),
+        )
+        c5.metric(
+            "Coût de fonctionnement de la PAC — année 1",
+            format_chf(
+                central.get("cout_pac_total_year0") if central is not None else None,
+                decimals=0,
+            ),
+            help=(
+                "Coût estimé de l'électricité et de la maintenance de la pompe à chaleur "
+                "pendant la première année."
+            ),
+        )
+        return
+
     c4, c5, c6 = st.columns(3)
     c4.metric(
         "CAPEX brut estimé",
@@ -1664,14 +1704,6 @@ def render_results(results: dict) -> None:
         format_chf(pac["capex_net"], decimals=0),
         help="Coût de l'investissement initial estimé après déduction des subventions.",
     )
-
-
-    if inputs.project_type != "replacement":
-        st.info(
-            "Pour un nouveau bâtiment, l'outil affiche les besoins estimés et le coût de la PAC. "
-            "La comparaison économique complète s'affiche surtout pour le remplacement d'un chauffage existant."
-        )
-        return
 
     if central is None:
         st.error("Résultat central introuvable. Vérifie que calcul_projet.py retourne bien la clé 'central'.")
@@ -1781,13 +1813,6 @@ def init_session_state() -> None:
 
 def main() -> None:
     st.title("Rentabilité d'une PAC géothermique en Suisse")
-    st.write(
-        "Cet outil permet de déterminer la rentabilité de l'installation d'une pompe "
-        "à chaleur géothermique par rapport à votre système de chauffage actuel. "
-        "Il prend en compte au mieux les caractéristiques de votre bâtiment et propose "
-        "une aide à la décision, mais il ne remplace pas un devis détaillé réalisé par "
-        "des professionnels."
-    )
 
     init_session_state()
 
