@@ -1576,10 +1576,9 @@ def build_quote_inputs_from_form() -> ProjectInputs:
     )
 
     st.write(
-        "Cet onglet utilise directement les valeurs présentes dans votre devis "
-        "ou votre étude technique. Les trajectoires futures des prix de l'énergie, "
-        "les coûts de fonctionnement, la rentabilité et les graphiques sont ensuite "
-        "calculés avec la même méthode que dans le projet sans devis."
+        "Cet onglet n'est utilisable que si vous disposez d'un devis pour pouvoir "
+        "remplir les détails techniques demandés. Il permet d'estimer la rentabilité "
+        "de l'installation d'une pompe à chaleur géothermique pour votre bâtiment."
     )
 
     postcode_valid = False
@@ -1619,11 +1618,24 @@ def build_quote_inputs_from_form() -> ProjectInputs:
     st.session_state["postcode_valid_quote"] = postcode_valid
     st.session_state["postcode_meta_quote"] = postcode_meta
 
-    building_type_label = st.selectbox(
-        "Typologie du bâtiment",
-        options=[label for _, label in TYPOLOGIES_MENU],
-        key="quote_building_type",
-    )
+    c1, c2 = st.columns(2)
+
+    with c1:
+        building_type_label = st.selectbox(
+            "Typologie du bâtiment",
+            options=[label for _, label in TYPOLOGIES_MENU],
+            key="quote_building_type",
+        )
+
+    with c2:
+        shab_m2 = st.number_input(
+            "Surface habitable du bâtiment (m²)",
+            min_value=1.0,
+            value=180.0,
+            step=10.0,
+            key="quote_shab_m2",
+        )
+
     building_type_key = next(
         key for key, label in TYPOLOGIES_MENU if label == building_type_label
     )
@@ -1634,8 +1646,7 @@ def build_quote_inputs_from_form() -> ProjectInputs:
     st.header("2. Données techniques du devis")
     st.caption(
         "Le CAPEX saisi correspond au coût total du devis avant les éventuelles "
-        "subventions. Pour un remplacement éligible, les subventions sont estimées "
-        "avec la même méthode que dans le projet sans devis."
+        "subventions."
     )
 
     c1, c2, c3 = st.columns(3)
@@ -1769,7 +1780,7 @@ def build_quote_inputs_from_form() -> ProjectInputs:
         sdep_mode="Données techniques du devis",
         sdep_m2=1.0,
         vh_m3=1.0,
-        shab_m2=None,
+        shab_m2=float(shab_m2),
         niveaux=None,
         perimetre_m=None,
         hauteur_m=DEFAULT_CEILING_HEIGHT_M,
@@ -1935,20 +1946,26 @@ def render_results(results: dict) -> None:
             "Voici les principales données techniques renseignées et les résultats "
             "calculés à partir du devis."
         )
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3 = st.columns(3)
         c1.metric(
+            "Surface habitable du bâtiment",
+            f"{float(inputs.shab_m2):.0f} m²" if inputs.shab_m2 is not None else "—",
+        )
+        c2.metric(
             "Puissance renseignée de la pompe à chaleur",
             f"{chauffage['p_pointe_kw']:.1f} kW",
         )
-        c2.metric(
+        c3.metric("COP renseigné", f"{pac['spf']:.2f}")
+
+        c4, c5 = st.columns(2)
+        c4.metric(
             "Besoin annuel de chauffage",
             f"{chauffage['energie_annuelle_kwh']:.0f} kWh/an",
         )
-        c3.metric(
+        c5.metric(
             "Besoin annuel de climatisation",
             f"{froid['q_froid_utile_kwh_an']:.0f} kWh/an",
         )
-        c4.metric("COP renseigné", f"{pac['spf']:.2f}")
     else:
         st.write(
             "Voici les principaux ordres de grandeur estimés pour votre bâtiment et pour "
