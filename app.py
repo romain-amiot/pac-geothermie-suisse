@@ -1013,14 +1013,35 @@ def build_price_sensitivity_display(price_sensitivity: dict) -> pd.DataFrame:
 # FORMULAIRE
 # ============================================================
 
-def build_inputs_from_form() -> ProjectInputs:
-    st.sidebar.header("Paramètres du projet")
+def clear_results_after_project_type_change() -> None:
+    """
+    Supprime les résultats calculés avec l'ancien type de projet.
 
-    project_type_label = st.sidebar.radio(
+    Cela évite d'afficher, après un changement de sélection, des résultats
+    correspondant encore au projet précédent.
+    """
+    st.session_state["results"] = None
+    reset_interactive_adjustments()
+
+
+def build_inputs_from_form() -> ProjectInputs:
+    # Le type de projet est désormais sélectionné dans le formulaire principal,
+    # avant toutes les autres entrées. Le remplacement d'un ancien chauffage
+    # reste le choix proposé par défaut.
+    project_type_label = st.radio(
         "Type de projet",
-        options=["Remplacement ancien chauffage", "Nouveau bâtiment"],
+        options=["Remplacer un ancien chauffage", "Nouveau bâtiment"],
+        index=0,
+        horizontal=True,
+        key="project_type_selector",
+        on_change=clear_results_after_project_type_change,
     )
-    project_type = "replacement" if project_type_label == "Remplacement ancien chauffage" else "new_building"
+
+    project_type = (
+        "replacement"
+        if project_type_label == "Remplacer un ancien chauffage"
+        else "new_building"
+    )
 
     if project_type == "replacement":
         st.write(
